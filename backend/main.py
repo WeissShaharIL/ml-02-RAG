@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import random
+import time
 import requests
 from typing import Optional, Generator
 from fastapi import FastAPI, HTTPException
@@ -19,7 +20,7 @@ OLLAMA_URL   = os.getenv("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = "llama3.2:3b"
 CHUNK_WORDS  = 300
 TOP_K        = 2
-EVAL_QUESTIONS = 5
+EVAL_QUESTIONS = 10
 
 CONTAINERS = {
     "backend":  "rag-backend",
@@ -68,11 +69,16 @@ def init_db():
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS eval_runs (
-                id         SERIAL PRIMARY KEY,
-                score_avg  FLOAT,
-                created_at TIMESTAMP DEFAULT NOW()
+                id               SERIAL PRIMARY KEY,
+                score_avg        FLOAT,
+                duration_seconds INTEGER,
+                created_at       TIMESTAMP DEFAULT NOW()
             )
         """))
+        try:
+            conn.execute(text("ALTER TABLE eval_runs ADD COLUMN IF NOT EXISTS duration_seconds INTEGER"))
+        except:
+            pass
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS eval_results (
                 id              SERIAL PRIMARY KEY,
@@ -347,16 +353,16 @@ def list_questions():
 def list_runs():
     with engine.connect() as conn:
         rows = conn.execute(
-            text("SELECT id, score_avg, created_at FROM eval_runs ORDER BY created_at DESC")
+            text("SELECT id, score_avg, duration_seconds, created_at FROM eval_runs ORDER BY created_at DESC")
         ).fetchall()
-    return [{"id": r[0], "score_avg": r[1], "created_at": str(r[2])} for r in rows]
+    return [{"id": r[0], "score_avg": r[1], "duration_seconds": r[2], "created_at": str(r[3])} for r in rows]
 
 
 @app.get("/eval/runs/{run_id}")
 def get_run(run_id: int):
     with engine.connect() as conn:
         run = conn.execute(
-            text("SELECT id, score_avg, created_at FROM eval_runs WHERE id = :id"),
+            text("SELECT id, score_avg, duration_seconds, created_at FROM eval_runs WHERE id = :id"),
             {"id": run_id}
         ).fetchone()
         if not run:
@@ -372,7 +378,7 @@ def get_run(run_id: int):
             {"run_id": run_id}
         ).fetchall()
     return {
-        "id": run[0], "score_avg": run[1], "created_at": str(run[2]),
+        "id": run[0], "score_avg": run[1], "duration_seconds": run[2], "created_at": str(run[3]),
         "results": [
             {"id": r[0], "question": r[1], "expected_answer": r[2], "actual_answer": r[3], "score": r[4], "human_score": r[5]}
             for r in results
@@ -494,6 +500,7 @@ def eval_run():
             run_id = result.fetchone()[0]
             conn.commit()
 
+        run_start = time.time()
         yield f"data: {json.dumps({'type': 'status', 'text': f'Starting evaluation of {len(questions)} questions...'})}\n\n"
 
         all_chunks = load_chunks()
@@ -558,15 +565,16 @@ Respond with ONLY a single integer from 0 to 10. No explanation."""
             yield f"data: {json.dumps({'type': 'result', 'id': result_id, 'question_num': i+1, 'total': len(questions), 'question': q['question'], 'expected_answer': q['expected_answer'], 'actual_answer': actual_answer, 'score': score})}\n\n"
 
         # Finalize run
-        score_avg = round(sum(scores) / len(scores), 1) if scores else 0
+        score_avg        = round(sum(scores) / len(scores), 1) if scores else 0
+        duration_seconds = int(time.time() - run_start)
         with engine.connect() as conn:
             conn.execute(
-                text("UPDATE eval_runs SET score_avg = :score_avg WHERE id = :id"),
-                {"score_avg": score_avg, "id": run_id}
+                text("UPDATE eval_runs SET score_avg = :score_avg, duration_seconds = :duration WHERE id = :id"),
+                {"score_avg": score_avg, "duration": duration_seconds, "id": run_id}
             )
             conn.commit()
 
-        yield f"data: {json.dumps({'type': 'done', 'run_id': run_id, 'score_avg': score_avg, 'total': len(questions)})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'run_id': run_id, 'score_avg': score_avg, 'total': len(questions), 'duration_seconds': duration_seconds})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 

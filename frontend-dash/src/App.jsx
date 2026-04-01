@@ -166,6 +166,7 @@ export default function App() {
   const [expandedRun, setExpandedRun]   = useState(null)
   const [expandedRunData, setExpandedRunData] = useState(null)
   const [generatedQs, setGeneratedQs]   = useState([])
+  const [questionsLoading, setQuestionsLoading] = useState(true)
 
   // Logs state
   const [logLines, setLogLines]         = useState([])
@@ -189,6 +190,14 @@ export default function App() {
   const fetchRuns = async () => {
     try { setPastRuns(await (await fetch(`${API}/eval/runs`)).json()) } catch { setPastRuns([]) }
   }
+  const fetchQuestions = async () => {
+    setQuestionsLoading(true)
+    try {
+      const data = await (await fetch(`${API}/eval/questions`)).json()
+      setGeneratedQs(data.map(q => ({ id: q.id, question: q.question, expected_answer: q.expected_answer, page_title: q.page_title })))
+    } catch { setGeneratedQs([]) }
+    setQuestionsLoading(false)
+  }
 
   const connectLogs = () => {
     if (esRef.current) esRef.current.close()
@@ -209,7 +218,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    fetchHealth(); fetchPages(); fetchRuns(); connectLogs()
+    fetchHealth(); fetchPages(); fetchRuns(); fetchQuestions(); connectLogs()
     const iv = setInterval(() => { fetchHealth(); fetchPages() }, 10000)
     return () => { clearInterval(iv); if (esRef.current) esRef.current.close() }
   }, [])
@@ -279,7 +288,10 @@ export default function App() {
           if (p.type === 'warning')  setEvalProgress(`⚠ ${p.text}`)
           if (p.type === 'question') setGeneratedQs(prev => [...prev, { question: p.question, expected_answer: p.expected_answer, page_title: p.page_title }])
           if (p.type === 'error')    setEvalProgress(`✗ ${p.text}`)
-          if (p.type === 'done')     setEvalProgress(`✓ Generated ${p.count} questions`)
+          if (p.type === 'done') {
+            setEvalProgress(`✓ Generated ${p.count} questions`)
+            fetchQuestions()
+          }
         }
       }
     } catch (e) { setEvalProgress(`✗ ${e.message}`) }
@@ -450,10 +462,11 @@ export default function App() {
           </div>
         )}
 
-        {/* Generated questions preview */}
-        {generatedQs.length > 0 && (
+        {/* Quiz bank */}
+        {(questionsLoading || generatedQs.length > 0) && (
           <div style={{ marginBottom: 16 }}>
-            <p style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>Generated Questions ({generatedQs.length})</p>
+            <p style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>Quiz Bank ({generatedQs.length} questions)</p>
+            {questionsLoading && <p style={{ color: t.muted, fontSize: 13 }}>Loading...</p>}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {generatedQs.map((q, i) => (
                 <div key={i} style={{ padding: '10px 14px', border: `1px solid ${t.border}`, borderRadius: 8, fontSize: 13 }}>
@@ -499,6 +512,9 @@ export default function App() {
                     <span style={{ color: t.muted, fontSize: 11 }}>#{run.id}</span>
                     <span style={{ flex: 1 }}>{new Date(run.created_at).toLocaleString()}</span>
                     <span style={{ fontWeight: 600, color: run.score_avg >= 7 ? t.up : run.score_avg >= 4 ? '#facc15' : t.down }}>{run.score_avg}/10</span>
+                    {run.duration_seconds != null && (
+                      <span style={{ color: t.muted, fontSize: 11 }}>{run.duration_seconds >= 60 ? `${Math.floor(run.duration_seconds/60)}m ${run.duration_seconds%60}s` : `${run.duration_seconds}s`}</span>
+                    )}
                     <span style={{ color: t.muted, fontSize: 11 }}>{expandedRun === run.id ? '▲' : '▼'}</span>
                   </div>
                   {expandedRun === run.id && expandedRunData && (
