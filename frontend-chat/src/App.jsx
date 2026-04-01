@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 
 const API = '/api'
 
 const themes = {
-  dark:  { bg: '#0f0f0f', surface: '#1a1a1a', border: '#2a2a2a', text: '#f0f0f0', muted: '#888', userBg: '#2563eb', userText: '#fff', modelBg: '#1e1e1e' },
-  light: { bg: '#f5f5f3', surface: '#fff',     border: '#e0dfd8', text: '#1a1a18', muted: '#73726c', userBg: '#1a1a18', userText: '#f5f5f3', modelBg: '#fff' },
+  dark:  { bg: '#0f0f0f', surface: '#1a1a1a', border: '#2a2a2a', text: '#f0f0f0', muted: '#888', userBg: '#2563eb', userText: '#fff', modelBg: '#1e1e1e', statusColor: '#facc15' },
+  light: { bg: '#f5f5f3', surface: '#fff',     border: '#e0dfd8', text: '#1a1a18', muted: '#73726c', userBg: '#1a1a18', userText: '#f5f5f3', modelBg: '#fff', statusColor: '#d97706' },
 }
 
 export default function App() {
@@ -13,6 +13,7 @@ export default function App() {
   const [loading, setLoading]   = useState(false)
   const [ready, setReady]       = useState(false)
   const [mode, setMode]         = useState('dark')
+  const bottomRef               = useRef(null)
 
   const t = themes[mode]
 
@@ -23,22 +24,66 @@ export default function App() {
       .catch(() => setReady(false))
   }, [])
 
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
   const send = async () => {
     const q = input.trim()
     if (!q || loading) return
     setInput('')
-    setMessages(prev => [...prev, { role: 'user', text: q }])
     setLoading(true)
+
+    // Add user message
+    setMessages(prev => [...prev, { role: 'user', text: q }])
+
+    // Add empty model message we'll update live
+    const modelIdx = Date.now()
+    setMessages(prev => [...prev, { role: 'model', id: modelIdx, status: 'Rewriting query...', text: '' }])
+
     try {
-      const res  = await fetch(`${API}/ask`, {
+      const res = await fetch(`${API}/ask`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ question: q }),
       })
-      const data = await res.json()
-      setMessages(prev => [...prev, { role: 'model', text: data.answer }])
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+
+      const reader  = res.body.getReader()
+      const decoder = new TextDecoder()
+      let   buffer  = ''
+
+      const updateModel = (updater) =>
+        setMessages(prev => prev.map(m => m.id === modelIdx ? { ...m, ...updater(m) } : m))
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() // keep incomplete line
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const payload = JSON.parse(line.slice(6))
+
+          if (payload.type === 'status') {
+            updateModel(m => ({ status: payload.text }))
+          } else if (payload.type === 'rewritten') {
+            updateModel(m => ({ rewritten: payload.text }))
+          } else if (payload.type === 'token') {
+            updateModel(m => ({ text: (m.text || '') + payload.text, status: null }))
+          } else if (payload.type === 'done') {
+            updateModel(m => ({ status: null }))
+          }
+        }
+      }
     } catch {
-      setMessages(prev => [...prev, { role: 'model', text: 'Could not reach the server.' }])
+      setMessages(prev => prev.map(m =>
+        m.id === modelIdx ? { ...m, status: null, text: 'Could not reach the server.' } : m
+      ))
     } finally {
       setLoading(false)
     }
@@ -63,7 +108,7 @@ export default function App() {
           <p style={{ color: t.muted, textAlign: 'center', marginTop: 40 }}>Ask anything from the knowledge base</p>
         )}
         {messages.map((m, i) => (
-          <div key={i} style={{ alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '80%' }}>
+          <div key={m.id || i} style={{ alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '80%' }}>
             <div style={{ fontSize: 11, color: t.muted, marginBottom: 3, textAlign: m.role === 'user' ? 'right' : 'left' }}>
               {m.role === 'user' ? 'You' : 'Model'}
             </div>
@@ -73,12 +118,30 @@ export default function App() {
               color:      m.role === 'user' ? t.userText : t.text,
               border: `1px solid ${t.border}`,
             }}>
-              {m.text}
+              {/* Stage indicator */}
+              {m.status && (
+                <div style={{ fontSize: 12, color: t.statusColor, marginBottom: m.text ? 8 : 0, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ display: 'inline-block', animation: 'spin 1s linear infinite' }}>⟳</span>
+                  {m.status}
+                </div>
+              )}
+
+              {/* Rewritten query hint */}
+              {m.rewritten && m.rewritten !== m.originalQuestion && (
+                <div style={{ fontSize: 11, color: t.muted, marginBottom: 6, fontStyle: 'italic' }}>
+                  ✎ {m.rewritten}
+                </div>
+              )}
+
+              {/* Answer text */}
+              {m.text || (!m.status && <span style={{ color: t.muted }}>…</span>)}
             </div>
           </div>
         ))}
-        {loading && <div style={{ alignSelf: 'flex-start', color: t.muted, fontSize: 13 }}>thinking...</div>}
+        <div ref={bottomRef} />
       </div>
+
+      <style>{`@keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }`}</style>
 
       <div style={{ display: 'flex', gap: 8, borderTop: `1px solid ${t.border}`, paddingTop: 12 }}>
         <input

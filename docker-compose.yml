@@ -19,11 +19,11 @@ services:
       retries: 5
 
   ollama:
-    image: ollama/ollama:latest
+    build: ./ollama
     container_name: rag-ollama
     restart: unless-stopped
     volumes:
-      - ollama_data:/root/.ollama
+      - ./data/ollama:/root/.ollama
     ports:
       - "11434:11434"
 
@@ -34,6 +34,8 @@ services:
     environment:
       DATABASE_URL: postgresql://rag:rag@postgres:5432/rag
       OLLAMA_URL: http://ollama:11434
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8000:8000"
     depends_on:
@@ -59,6 +61,3 @@ services:
       - "3001:80"
     depends_on:
       - backend
-
-volumes:
-  ollama_data:
