@@ -23,18 +23,11 @@ services:
     container_name: rag-ollama
     restart: unless-stopped
     environment:
-      OLLAMA_NUM_GPU: ${GPU_ENABLED:+0}
+      OLLAMA_NUM_GPU: 0
     volumes:
       - ./data/ollama:/root/.ollama
     ports:
       - "11434:11434"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: ${GPU_DRIVER:-}
-              count: ${GPU_COUNT:-}
-              capabilities: ${GPU_CAPS:-}
 
   backend:
     build: ./backend
