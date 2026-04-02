@@ -146,6 +146,8 @@ export default function App() {
   const [confirmId, setConfirmId]   = useState(null)
   const [deleting, setDeleting]     = useState(null)
   const [modalPageId, setModalPageId] = useState(null)
+  const [resetConfirm, setResetConfirm] = useState(false)
+  const [resetting, setResetting]       = useState(false)
 
   // Eval state
   const [evalStatus, setEvalStatus]     = useState(null)   // 'generating' | 'running' | null
@@ -264,6 +266,25 @@ export default function App() {
     finally { setDeleting(null) }
   }
 
+  const resetAll = async () => {
+    setResetting(true)
+    try {
+      await fetch(`${API}/reset`, { method: 'POST' })
+      setPages([])
+      setGeneratedQs([])
+      setPastRuns([])
+      setEvalResults([])
+      setEvalSummary(null)
+      setEvalProgress(null)
+      setMessage({ type: 'success', text: '✓ All data wiped. System ready for fresh ingestion.' })
+    } catch (e) {
+      setMessage({ type: 'error', text: `✗ Reset failed: ${e.message}` })
+    } finally {
+      setResetting(false)
+      setResetConfirm(false)
+    }
+  }
+
   // ── Eval: generate questions ────────────────────────────────────────────────
   const runGenerate = async () => {
     setEvalStatus('generating')
@@ -361,10 +382,30 @@ export default function App() {
           <h1 style={{ fontSize: 24, fontWeight: 600, marginBottom: 4 }}>RAG Platform</h1>
           <p style={{ color: t.muted }}>DevOps Dashboard</p>
         </div>
-        <button onClick={() => setMode(m => m === 'dark' ? 'light' : 'dark')}
-          style={{ padding: '6px 12px', borderRadius: 8, border: `1px solid ${t.border}`, background: t.surface, color: t.text, cursor: 'pointer', fontSize: 13 }}>
-          {mode === 'dark' ? '☀ Light' : '🌙 Dark'}
-        </button>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {resetConfirm ? (
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span style={{ fontSize: 12, color: t.down }}>Wipe all data?</span>
+              <button onClick={resetAll} disabled={resetting}
+                style={{ padding: '6px 12px', borderRadius: 8, border: 'none', background: '#ef4444', color: '#fff', cursor: 'pointer', fontSize: 13, opacity: resetting ? 0.5 : 1 }}>
+                {resetting ? '...' : 'Yes, wipe'}
+              </button>
+              <button onClick={() => setResetConfirm(false)}
+                style={{ padding: '6px 12px', borderRadius: 8, border: `1px solid ${t.border}`, background: t.surface, color: t.text, cursor: 'pointer', fontSize: 13 }}>
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button onClick={() => setResetConfirm(true)}
+              style={{ padding: '6px 12px', borderRadius: 8, border: `1px solid ${t.down}`, background: 'transparent', color: t.down, cursor: 'pointer', fontSize: 13 }}>
+              🗑 Reset All
+            </button>
+          )}
+          <button onClick={() => setMode(m => m === 'dark' ? 'light' : 'dark')}
+            style={{ padding: '6px 12px', borderRadius: 8, border: `1px solid ${t.border}`, background: t.surface, color: t.text, cursor: 'pointer', fontSize: 13 }}>
+            {mode === 'dark' ? '☀ Light' : '🌙 Dark'}
+          </button>
+        </div>
       </div>
 
       {/* Health */}

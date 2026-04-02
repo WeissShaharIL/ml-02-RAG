@@ -175,9 +175,10 @@ def bm25_retrieve(question: str, chunks: list[str]) -> str:
     return " ".join(chunks[i] for i in top_indices)
 
 
-def call_ollama_sync(prompt: str, timeout: int = 120) -> str:
+def call_ollama_sync(prompt: str, timeout: int = 600) -> str:
+    """Blocking Ollama call. timeout is the read timeout in seconds (CPU can be slow)."""
     payload  = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
-    response = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=timeout)
+    response = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=(10, timeout))
     response.raise_for_status()
     return response.json()["response"].strip()
 
@@ -202,7 +203,7 @@ Return only the rewritten question, nothing else.
 
 Question: {question}"""
     try:
-        return call_ollama_sync(prompt, timeout=60)
+        return call_ollama_sync(prompt, timeout=600)
     except:
         return question
 
@@ -445,7 +446,7 @@ Respond in this exact JSON format with no extra text:
 {{"question": "...", "answer": "..."}}"""
 
             try:
-                raw = call_ollama_sync(prompt, timeout=120)
+                raw = call_ollama_sync(prompt, timeout=600)
                 raw = re.sub(r'^```(?:json)?\s*', '', raw.strip())
                 raw = re.sub(r'\s*```$', '', raw.strip())
                 match = re.search(r'\{.*?\}', raw, re.DOTALL)
@@ -524,7 +525,7 @@ Question: {q['question']}
 
 Answer:"""
             try:
-                actual_answer = call_ollama_sync(answer_prompt, timeout=120)
+                actual_answer = call_ollama_sync(answer_prompt, timeout=600)
             except Exception as e:
                 actual_answer = f"[error: {e}]"
 
@@ -545,7 +546,7 @@ Give a score from 0 to 10 where:
 
 Respond with ONLY a single integer from 0 to 10. No explanation."""
             try:
-                score_raw = call_ollama_sync(judge_prompt, timeout=120)
+                score_raw = call_ollama_sync(judge_prompt, timeout=600)
                 score     = int(re.search(r'\d+', score_raw).group())
                 score     = max(0, min(10, score))
             except:
@@ -578,6 +579,20 @@ Respond with ONLY a single integer from 0 to 10. No explanation."""
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
+
+
+@app.post("/reset")
+def reset_all():
+    """Truncate all data tables. System stays running."""
+    with engine.connect() as conn:
+        # Order matters — delete children before parents
+        conn.execute(text("TRUNCATE TABLE eval_results   RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE eval_runs      RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE quiz_questions RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE chunks         RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE pages          RESTART IDENTITY CASCADE"))
+        conn.commit()
+    return {"status": "ok", "message": "All data wiped. System is ready for fresh ingestion."}
 
 @app.get("/logs/stream")
 async def logs_stream():
