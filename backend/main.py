@@ -101,13 +101,13 @@ def init_db():
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS versions (
-                id         SERIAL PRIMARY KEY,
+                id              SERIAL PRIMARY KEY,
                 name            TEXT NOT NULL UNIQUE,
                 score_avg       FLOAT,
                 human_score_avg FLOAT,
                 page_count      INTEGER NOT NULL DEFAULT 0,
                 status          TEXT NOT NULL DEFAULT 'saved',
-                created_at TIMESTAMP DEFAULT NOW()
+                created_at      TIMESTAMP DEFAULT NOW()
             )
         """))
         conn.execute(text("""
@@ -145,7 +145,6 @@ def init_db():
             conn.execute(text("ALTER TABLE versions ADD COLUMN IF NOT EXISTS human_score_avg FLOAT"))
         except:
             pass
-        # Migration: add human_score to existing tables if not present
         try:
             conn.execute(text("ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS human_score INTEGER"))
         except:
@@ -209,6 +208,7 @@ def ingest_content(title: str, content: str, url: Optional[str] = None) -> int:
 
 
 def load_chunks() -> list[str]:
+    """Load live chunks (no active production version)."""
     with engine.connect() as conn:
         rows = conn.execute(
             text("SELECT text FROM chunks ORDER BY page_id, position")
@@ -216,8 +216,42 @@ def load_chunks() -> list[str]:
     return [row[0] for row in rows]
 
 
+def load_chunks_for_ask() -> list[str]:
+    """Load chunks for /ask — uses production version if one exists, else live chunks."""
+    with engine.connect() as conn:
+        prod = conn.execute(
+            text("SELECT id FROM versions WHERE status = 'production' LIMIT 1")
+        ).fetchone()
+
+        if prod:
+            rows = conn.execute(
+                text("""
+                    SELECT vc.text
+                    FROM version_chunks vc
+                    JOIN version_pages vp ON vc.version_page_id = vp.id
+                    WHERE vp.version_id = :version_id
+                    ORDER BY vp.id, vc.position
+                """),
+                {"version_id": prod[0]}
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                text("SELECT text FROM chunks ORDER BY page_id, position")
+            ).fetchall()
+
+    return [row[0] for row in rows]
+
+
+def get_production_version() -> Optional[dict]:
+    """Return the active production version or None."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, name FROM versions WHERE status = 'production' LIMIT 1")
+        ).fetchone()
+    return {"id": row[0], "name": row[1]} if row else None
+
+
 def load_chunks_with_page() -> list[dict]:
-    """Load chunks with their page_id for eval question generation."""
     with engine.connect() as conn:
         rows = conn.execute(
             text("SELECT c.id, c.page_id, c.text, p.title FROM chunks c JOIN pages p ON c.page_id = p.id ORDER BY c.page_id, c.position")
@@ -240,7 +274,6 @@ def bm25_retrieve(question: str, chunks: list[str]) -> str:
 
 
 def call_ollama_sync(prompt: str, timeout: int = 600, model: str = None) -> str:
-    """Blocking Ollama call. timeout is the read timeout in seconds (CPU can be slow)."""
     payload  = {"model": model or OLLAMA_MODEL, "prompt": prompt, "stream": False}
     response = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=(10, timeout))
     response.raise_for_status()
@@ -284,11 +317,11 @@ class AskRequest(BaseModel):
     question: str
 
 class EvalGenerateRequest(BaseModel):
-    num_questions: int = 10   # how many questions to generate
+    num_questions: int = 10
 
 class EvalRunRequest(BaseModel):
-    num_questions: int = 10   # how many questions to use (1–10)
-    cycles:        int = 1    # how many back-to-back eval runs
+    num_questions: int = 10
+    cycles:        int = 1
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -304,10 +337,13 @@ def health():
         ollama = "up" if res.status_code == 200 else "down"
     except:
         ollama = "down"
+
+    prod = get_production_version()
     return {
-        "status":   "ok" if pg == "up" and ollama == "up" else "degraded",
-        "postgres": pg,
-        "ollama":   ollama,
+        "status":             "ok" if pg == "up" and ollama == "up" else "degraded",
+        "postgres":           pg,
+        "ollama":             ollama,
+        "production_version": prod,  # {"id": ..., "name": ...} or None
     }
 
 
@@ -381,7 +417,9 @@ def ask(req: AskRequest):
         yield f"data: {json.dumps({'type': 'rewritten', 'text': clean_question})}\n\n"
 
         yield f"data: {json.dumps({'type': 'status', 'text': 'Searching knowledge base...'})}\n\n"
-        chunks = load_chunks()
+
+        # Use production version chunks if deployed, else live chunks
+        chunks = load_chunks_for_ask()
         if not chunks:
             yield f"data: {json.dumps({'type': 'token', 'text': 'No knowledge base yet. Ingest some pages first.'})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -444,7 +482,9 @@ def list_runs():
                 er.duration_seconds,
                 er.created_at,
                 ROUND(AVG(res.human_score)::numeric, 1) AS human_score_avg,
-                COUNT(res.human_score)                  AS human_rated_count
+                COUNT(res.human_score)                  AS human_rated_count,
+                er.ollama_model,
+                er.judge_model
             FROM eval_runs er
             LEFT JOIN eval_results res ON res.run_id = er.id AND res.human_score IS NOT NULL
             GROUP BY er.id
@@ -491,12 +531,9 @@ def get_run(run_id: int):
     }
 
 
-
-
 @app.patch("/eval/results/{result_id}")
 def patch_result(result_id: int, body: dict):
-    """Set human_score: 10 for thumbs up, 0 for thumbs down, null to clear."""
-    human_score = body.get("human_score")  # 10, 0, or None
+    human_score = body.get("human_score")
     with engine.connect() as conn:
         result = conn.execute(
             text("UPDATE eval_results SET human_score = :human_score WHERE id = :id RETURNING id"),
@@ -507,10 +544,10 @@ def patch_result(result_id: int, body: dict):
         conn.commit()
     return {"id": result_id, "human_score": human_score}
 
+
 @app.post("/eval/generate")
 def eval_generate(req: EvalGenerateRequest = EvalGenerateRequest()):
-    """Generate N questions from random chunks and ADD them to the quiz bank."""
-    n = max(1, min(req.num_questions, 50))  # cap at 50
+    n = max(1, min(req.num_questions, 50))
 
     def generate():
         yield f"data: {json.dumps({'type': 'status', 'text': 'Loading knowledge base...'})}\n\n"
@@ -520,7 +557,6 @@ def eval_generate(req: EvalGenerateRequest = EvalGenerateRequest()):
             yield f"data: {json.dumps({'type': 'error', 'text': f'Not enough chunks ({len(all_chunks)}) to generate {n} questions.'})}\n\n"
             return
 
-        # Balanced sampling: pick chunks evenly across pages
         by_page = {}
         for chunk in all_chunks:
             by_page.setdefault(chunk["page_id"], []).append(chunk)
@@ -578,7 +614,7 @@ Respond in this exact JSON format with no extra text:
                 conn.commit()
 
             saved.append({"id": qid, "question": question, "expected_answer": expected_answer, "page_title": chunk["title"]})
-            yield f"data: {json.dumps({'type': 'question', 'question': question, 'expected_answer': expected_answer, 'page_title': chunk['title']})}\n\n"
+            yield f"data: {json.dumps({'type': 'question', 'id': qid, 'question': question, 'expected_answer': expected_answer, 'page_title': chunk['title']})}\n\n"
 
         yield f"data: {json.dumps({'type': 'done', 'count': len(saved)})}\n\n"
 
@@ -587,12 +623,10 @@ Respond in this exact JSON format with no extra text:
 
 @app.post("/eval/run")
 def eval_run(req: EvalRunRequest = EvalRunRequest()):
-    """Run evaluation: BM25 retrieve → Ollama answer → Ollama judge (0-10) for each question."""
     num_questions = max(1, min(req.num_questions, EVAL_QUESTIONS))
     cycles        = max(1, min(req.cycles, 5))
 
     def generate():
-        # Load all available questions for random sampling each cycle
         with engine.connect() as conn:
             all_rows = conn.execute(
                 text("SELECT id, question, expected_answer FROM quiz_questions ORDER BY created_at DESC")
@@ -606,13 +640,11 @@ def eval_run(req: EvalRunRequest = EvalRunRequest()):
         yield f"data: {json.dumps({'type': 'status', 'text': f'Starting {cycles} evaluation cycle(s) of {num_questions} questions each...'})}\n\n"
 
         for cycle in range(cycles):
-            # Re-sample randomly on each cycle
             questions = random.sample(all_questions, min(num_questions, len(all_questions)))
 
             if cycles > 1:
                 yield f"data: {json.dumps({'type': 'status', 'text': f'Cycle {cycle+1}/{cycles}...'})}\n\n"
 
-            # Create eval run record
             with engine.connect() as conn:
                 result = conn.execute(
                     text("INSERT INTO eval_runs (score_avg, ollama_model, judge_model) VALUES (NULL, :ollama_model, :judge_model) RETURNING id"),
@@ -621,53 +653,50 @@ def eval_run(req: EvalRunRequest = EvalRunRequest()):
                 run_id = result.fetchone()[0]
                 conn.commit()
 
-            run_start = time.time()
-            yield f"data: {json.dumps({'type': 'status', 'text': f'Cycle {cycle+1}/{cycles} — evaluating {len(questions)} questions...'})}\n\n"
-
+            run_start  = time.time()
             all_chunks = load_chunks()
             scores     = []
 
+            yield f"data: {json.dumps({'type': 'status', 'text': f'Cycle {cycle+1}/{cycles} — evaluating {len(questions)} questions...'})}\n\n"
+
             for i, q in enumerate(questions):
-                # Step 1 — retrieve
                 yield f"data: {json.dumps({'type': 'progress', 'step': 'retrieving', 'question_num': i+1, 'total': len(questions), 'question': q['question']})}\n\n"
                 context = bm25_retrieve(q["question"], all_chunks) if all_chunks else ""
 
-                # Step 2 — answer
                 yield f"data: {json.dumps({'type': 'progress', 'step': 'answering', 'question_num': i+1, 'total': len(questions), 'question': q['question']})}\n\n"
                 answer_prompt = f"""You are a helpful assistant. Answer the question using ONLY the context below.
-    If the answer is not in the context, say "I don't have information about that."
-    Keep your answer concise — 1 to 2 sentences maximum.
+If the answer is not in the context, say "I don't have information about that."
+Keep your answer concise — 1 to 2 sentences maximum.
 
-    Context:
-    {context}
+Context:
+{context}
 
-    Question: {q['question']}
+Question: {q['question']}
 
-    Answer:"""
+Answer:"""
                 try:
                     actual_answer = call_ollama_sync(answer_prompt, timeout=600)
                 except Exception as e:
                     actual_answer = f"[error: {e}]"
 
-                # Step 3 — judge
                 yield f"data: {json.dumps({'type': 'progress', 'step': 'judging', 'question_num': i+1, 'total': len(questions), 'question': q['question']})}\n\n"
                 judge_prompt = f"""You are an evaluation judge. Your job is to check whether the actual answer contains the correct information from the expected answer.
 
-    Question: {q['question']}
-    Expected answer: {q['expected_answer']}
-    Actual answer: {actual_answer}
+Question: {q['question']}
+Expected answer: {q['expected_answer']}
+Actual answer: {actual_answer}
 
-    Scoring rules:
-    - 10 = the actual answer contains the correct information, even if phrased differently or as a full sentence
-    - 7-9 = mostly correct, minor omission or slight inaccuracy
-    - 4-6 = partially correct, contains some right information but missing key parts
-    - 1-3 = mostly wrong but tangentially related
-    - 0 = completely wrong, irrelevant, or "I don't have information about that"
+Scoring rules:
+- 10 = the actual answer contains the correct information, even if phrased differently or as a full sentence
+- 7-9 = mostly correct, minor omission or slight inaccuracy
+- 4-6 = partially correct, contains some right information but missing key parts
+- 1-3 = mostly wrong but tangentially related
+- 0 = completely wrong, irrelevant, or "I don't have information about that"
 
-    IMPORTANT: Do NOT penalize for different phrasing, extra context, or full sentences vs fragments.
-    Only check if the core factual content is correct.
+IMPORTANT: Do NOT penalize for different phrasing, extra context, or full sentences vs fragments.
+Only check if the core factual content is correct.
 
-    Respond with ONLY a single integer from 0 to 10. No explanation."""
+Respond with ONLY a single integer from 0 to 10. No explanation."""
                 try:
                     score_raw = call_ollama_sync(judge_prompt, timeout=600, model=OLLAMA_JUDGE_MODEL)
                     score     = int(re.search(r'\d+', score_raw).group())
@@ -677,7 +706,6 @@ def eval_run(req: EvalRunRequest = EvalRunRequest()):
 
                 scores.append(score)
 
-                # Save result
                 with engine.connect() as conn:
                     row = conn.execute(
                         text("INSERT INTO eval_results (run_id, question_id, actual_answer, score) VALUES (:run_id, :question_id, :actual_answer, :score) RETURNING id"),
@@ -688,7 +716,6 @@ def eval_run(req: EvalRunRequest = EvalRunRequest()):
 
                 yield f"data: {json.dumps({'type': 'result', 'id': result_id, 'question_num': i+1, 'total': len(questions), 'question': q['question'], 'expected_answer': q['expected_answer'], 'actual_answer': actual_answer, 'score': score})}\n\n"
 
-            # Finalize run
             score_avg        = round(sum(scores) / len(scores), 1) if scores else 0
             duration_seconds = int(time.time() - run_start)
             with engine.connect() as conn:
@@ -705,13 +732,11 @@ def eval_run(req: EvalRunRequest = EvalRunRequest()):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-
+# ── Version endpoints ──────────────────────────────────────────────────────────
 
 @app.post("/versions/save")
 def save_version():
-    """Snapshot current pages + chunks into a new immutable version."""
     with engine.connect() as conn:
-        # Load all current pages
         pages = conn.execute(
             text("SELECT id, title, url, content, created_at FROM pages ORDER BY created_at")
         ).fetchall()
@@ -719,7 +744,6 @@ def save_version():
         if not pages:
             raise HTTPException(status_code=400, detail="No pages to snapshot. Ingest some pages first.")
 
-        # Get latest eval scores (Ollama + human) if available
         run = conn.execute(
             text("""
                 SELECT er.score_avg,
@@ -735,21 +759,18 @@ def save_version():
         score_avg       = run[0] if run else None
         human_score_avg = float(run[1]) if run and run[1] is not None else None
 
-        # Generate unique 7-char version name
         while True:
             name = ''.join(random.choices(string.ascii_lowercase + string.digits, k=7))
             existing = conn.execute(text("SELECT id FROM versions WHERE name = :name"), {"name": name}).fetchone()
             if not existing:
                 break
 
-        # Create version record
         version_row = conn.execute(
             text("INSERT INTO versions (name, score_avg, human_score_avg, page_count) VALUES (:name, :score_avg, :human_score_avg, :page_count) RETURNING id"),
             {"name": name, "score_avg": score_avg, "human_score_avg": human_score_avg, "page_count": len(pages)}
         )
         version_id = version_row.fetchone()[0]
 
-        # Copy each page and its chunks
         for page in pages:
             vpage_row = conn.execute(
                 text("""INSERT INTO version_pages (version_id, original_page_id, title, url, content, created_at)
@@ -770,7 +791,6 @@ def save_version():
                     {"vpage_id": vpage_id, "position": chunk[0], "text": chunk[1]}
                 )
 
-        # Snapshot latest eval results (human + ollama scores) at save time
         eval_rows = conn.execute(text("""
             SELECT q.question, q.expected_answer, er.actual_answer, er.score, er.human_score
             FROM eval_results er
@@ -793,12 +813,88 @@ def save_version():
         conn.commit()
 
     return {
-        "version_name":      name,
-        "page_count":        len(pages),
-        "score_avg":         score_avg,
-        "human_score_avg":   human_score_avg,
+        "version_name":       name,
+        "page_count":         len(pages),
+        "score_avg":          score_avg,
+        "human_score_avg":    human_score_avg,
         "eval_results_saved": len(eval_rows),
     }
+
+
+@app.post("/versions/{version_id}/deploy")
+def deploy_version(version_id: int):
+    """Set this version as production. Demote any existing production to retired."""
+    with engine.connect() as conn:
+        version = conn.execute(
+            text("SELECT id, name, status FROM versions WHERE id = :id"),
+            {"id": version_id}
+        ).fetchone()
+        if not version:
+            raise HTTPException(status_code=404, detail="Version not found")
+
+        # Demote current production (if any) to retired
+        conn.execute(
+            text("UPDATE versions SET status = 'retired' WHERE status = 'production'")
+        )
+
+        # Promote this version
+        conn.execute(
+            text("UPDATE versions SET status = 'production' WHERE id = :id"),
+            {"id": version_id}
+        )
+        conn.commit()
+
+    return {"version_id": version_id, "name": version[1], "status": "production"}
+
+
+@app.post("/versions/{version_id}/rollback")
+def rollback_version(version_id: int):
+    """Retire the current production version and re-promote this one to production."""
+    with engine.connect() as conn:
+        version = conn.execute(
+            text("SELECT id, name, status FROM versions WHERE id = :id"),
+            {"id": version_id}
+        ).fetchone()
+        if not version:
+            raise HTTPException(status_code=404, detail="Version not found")
+        if version[2] == 'production':
+            raise HTTPException(status_code=400, detail="Version is already in production")
+
+        # Demote current production to retired
+        conn.execute(
+            text("UPDATE versions SET status = 'retired' WHERE status = 'production'")
+        )
+
+        # Promote requested version back to production
+        conn.execute(
+            text("UPDATE versions SET status = 'production' WHERE id = :id"),
+            {"id": version_id}
+        )
+        conn.commit()
+
+    return {"version_id": version_id, "name": version[1], "status": "production"}
+
+
+@app.post("/versions/{version_id}/undeploy")
+def undeploy_version(version_id: int):
+    """Take production version back to saved (chat falls back to live data)."""
+    with engine.connect() as conn:
+        version = conn.execute(
+            text("SELECT id, name, status FROM versions WHERE id = :id"),
+            {"id": version_id}
+        ).fetchone()
+        if not version:
+            raise HTTPException(status_code=404, detail="Version not found")
+        if version[2] != 'production':
+            raise HTTPException(status_code=400, detail="Version is not in production")
+
+        conn.execute(
+            text("UPDATE versions SET status = 'saved' WHERE id = :id"),
+            {"id": version_id}
+        )
+        conn.commit()
+
+    return {"version_id": version_id, "name": version[1], "status": "saved"}
 
 
 @app.get("/versions/{version_id}/eval")
@@ -819,25 +915,25 @@ def list_versions():
         rows = conn.execute(
             text("SELECT id, name, score_avg, human_score_avg, page_count, status, created_at FROM versions ORDER BY created_at DESC")
         ).fetchall()
-    return [{"id": r[0], "name": r[1], "score_avg": r[2], "human_score_avg": r[3], "page_count": r[4], "status": r[5], "created_at": str(r[6])} for r in rows]
+    return [{"id": r[0], "name": r[1], "score_avg": r[2], "human_score_avg": r[3],
+             "page_count": r[4], "status": r[5], "created_at": str(r[6])} for r in rows]
 
 
 @app.post("/reset")
 def reset_all():
-    """Truncate all data tables. System stays running."""
     with engine.connect() as conn:
-        # Order matters — delete children before parents
-        conn.execute(text("TRUNCATE TABLE eval_results   RESTART IDENTITY CASCADE"))
-        conn.execute(text("TRUNCATE TABLE eval_runs      RESTART IDENTITY CASCADE"))
-        conn.execute(text("TRUNCATE TABLE quiz_questions RESTART IDENTITY CASCADE"))
-        conn.execute(text("TRUNCATE TABLE chunks         RESTART IDENTITY CASCADE"))
-        conn.execute(text("TRUNCATE TABLE pages          RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE eval_results         RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE eval_runs            RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE quiz_questions       RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE chunks               RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE pages                RESTART IDENTITY CASCADE"))
         conn.execute(text("TRUNCATE TABLE version_eval_results RESTART IDENTITY CASCADE"))
         conn.execute(text("TRUNCATE TABLE version_chunks       RESTART IDENTITY CASCADE"))
         conn.execute(text("TRUNCATE TABLE version_pages        RESTART IDENTITY CASCADE"))
         conn.execute(text("TRUNCATE TABLE versions             RESTART IDENTITY CASCADE"))
         conn.commit()
     return {"status": "ok", "message": "All data wiped. System is ready for fresh ingestion."}
+
 
 @app.get("/logs/stream")
 async def logs_stream():

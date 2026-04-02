@@ -124,6 +124,21 @@ const Card = ({ children, t, style = {} }) => (
   </div>
 )
 
+// ── Status badge for version ───────────────────────────────────────────────────
+const StatusBadge = ({ status }) => {
+  const styles = {
+    production: { bg: '#16a34a22', color: '#22c55e', border: '#16a34a44', label: '● live' },
+    retired:    { bg: '#88888822', color: '#888',     border: '#88888844', label: '○ retired' },
+    saved:      { bg: '#3b82f622', color: '#60a5fa',  border: '#3b82f644', label: '◆ saved' },
+  }
+  const s = styles[status] || styles.saved
+  return (
+    <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, background: s.bg, color: s.color, border: `1px solid ${s.border}`, fontWeight: 600, whiteSpace: 'nowrap' }}>
+      {s.label}
+    </span>
+  )
+}
+
 export default function App() {
   const [health, setHealth]           = useState(null)
   const [pages, setPages]             = useState([])
@@ -153,6 +168,7 @@ export default function App() {
   const [expandedRunData, setExpandedRunData] = useState(null)
   const [versions, setVersions]           = useState([])
   const [saving, setSaving]               = useState(false)
+  const [versionAction, setVersionAction] = useState(null) // version id currently being acted on
   const [generatedQs, setGeneratedQs]     = useState([])
   const [quizCollapsed, setQuizCollapsed] = useState(false)
   const [quizSearch, setQuizSearch]       = useState('')
@@ -170,6 +186,9 @@ export default function App() {
   const esRef           = useRef(null)
 
   const t = themes[mode]
+
+  // derived: which version is currently in production?
+  const productionVersion = versions.find(v => v.status === 'production') || null
 
   useEffect(() => { logPausedRef.current = logPaused }, [logPaused])
 
@@ -219,7 +238,7 @@ export default function App() {
     setExpandedRunData(prev => prev ? { ...prev, results: prev.results.map(r => r.id === resultId ? { ...r, human_score: score } : r) } : prev)
   }
 
-  // ── Actions ──────────────────────────────────────────────────────────────────
+  // ── Actions ───────────────────────────────────────────────────────────────────
   const ingestURL = async () => {
     if (!url.trim()) return
     setIngesting(true); setMessage(null)
@@ -277,6 +296,39 @@ export default function App() {
     finally { setSaving(false) }
   }
 
+  const deployVersion = async (id, name) => {
+    setVersionAction(id)
+    try {
+      const res = await fetch(`${API}/versions/${id}/deploy`, { method: 'POST' })
+      if (!res.ok) throw new Error((await res.json()).detail)
+      setMessage({ type: 'success', text: `✓ Version ${name} deployed — chat is now serving this knowledge base` })
+      fetchVersions()
+    } catch (e) { setMessage({ type: 'error', text: `✗ ${e.message}` }) }
+    finally { setVersionAction(null) }
+  }
+
+  const rollbackVersion = async (id, name) => {
+    setVersionAction(id)
+    try {
+      const res = await fetch(`${API}/versions/${id}/rollback`, { method: 'POST' })
+      if (!res.ok) throw new Error((await res.json()).detail)
+      setMessage({ type: 'success', text: `✓ Rolled back to version ${name}` })
+      fetchVersions()
+    } catch (e) { setMessage({ type: 'error', text: `✗ ${e.message}` }) }
+    finally { setVersionAction(null) }
+  }
+
+  const undeployVersion = async (id, name) => {
+    setVersionAction(id)
+    try {
+      const res = await fetch(`${API}/versions/${id}/undeploy`, { method: 'POST' })
+      if (!res.ok) throw new Error((await res.json()).detail)
+      setMessage({ type: 'success', text: `✓ Version ${name} undeployed — chat is now using live data` })
+      fetchVersions()
+    } catch (e) { setMessage({ type: 'error', text: `✗ ${e.message}` }) }
+    finally { setVersionAction(null) }
+  }
+
   const resetAll = async () => {
     setResetting(true)
     try {
@@ -315,8 +367,8 @@ export default function App() {
     setEvalStatus('running'); setEvalProgress('Starting evaluation...')
     setEvalResults([]); setEvalSummary(null); setResultsCollapsed(false); setQuizCollapsed(true)
     try {
-      const effectiveNumQ    = Math.min(parseInt(evalNumQ) || 10, generatedQs.length || parseInt(evalNumQ) || 10)
-      const effectiveCycles  = Math.max(1, parseInt(evalCycles) || 1)
+      const effectiveNumQ   = Math.min(parseInt(evalNumQ) || 10, generatedQs.length || parseInt(evalNumQ) || 10)
+      const effectiveCycles = Math.max(1, parseInt(evalCycles) || 1)
       const res = await fetch(`${API}/eval/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ num_questions: effectiveNumQ, cycles: effectiveCycles }) })
       const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = ''
       while (true) {
@@ -345,7 +397,7 @@ export default function App() {
     catch { setExpandedRunData(null) }
   }
 
-  // ── Shared styles ─────────────────────────────────────────────────────────────
+  // ── Shared styles ──────────────────────────────────────────────────────────────
   const inputStyle = { width: '100%', padding: '9px 12px', borderRadius: 7, border: `1px solid ${t.border}`, fontSize: 13, background: t.inputBg, color: t.text, outline: 'none', marginBottom: 8, boxSizing: 'border-box' }
   const btn = (disabled, color = t.accent) => ({ padding: '8px 16px', background: color, color: '#fff', border: 'none', borderRadius: 7, fontSize: 13, cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.5 : 1, whiteSpace: 'nowrap' })
   const numInput = { width: 44, padding: '4px 8px', borderRadius: 6, border: `1px solid ${t.border}`, background: t.inputBg, color: t.text, fontSize: 13, textAlign: 'center' }
@@ -356,11 +408,21 @@ export default function App() {
 
       {modalPageId && <PageModal pageId={modalPageId} t={t} onClose={() => setModalPageId(null)} />}
 
-      {/* ── Top bar ───────────────────────────────────────────────────────────── */}
+      {/* ── Top bar ────────────────────────────────────────────────────────────── */}
       <div style={{ borderBottom: `1px solid ${t.border}`, background: t.surface, padding: '0 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 52, flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <span style={{ fontSize: 15, fontWeight: 700, letterSpacing: '-0.02em' }}>RAG Platform</span>
           <span style={{ fontSize: 11, color: t.muted, padding: '2px 8px', border: `1px solid ${t.border}`, borderRadius: 20 }}>DevOps Dashboard</span>
+          {/* Chat serving indicator */}
+          {productionVersion ? (
+            <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 20, background: '#16a34a22', color: '#22c55e', border: '1px solid #16a34a44' }}>
+              Chat → <span style={{ fontFamily: 'monospace', fontWeight: 700 }}>{productionVersion.name}</span>
+            </span>
+          ) : (
+            <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 20, background: '#3b82f622', color: '#60a5fa', border: '1px solid #3b82f644' }}>
+              Chat → live data
+            </span>
+          )}
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {message && (
@@ -383,11 +445,11 @@ export default function App() {
         </div>
       </div>
 
-      {/* ── 3-column body ─────────────────────────────────────────────────────── */}
+      {/* ── 3-column body ──────────────────────────────────────────────────────── */}
       <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '220px 1fr 300px', minHeight: 0 }}>
 
-        {/* ── LEFT SIDEBAR: Health + Versions ───────────────────────────────── */}
-        <div style={{ borderRight: `1px solid ${t.border}`, padding: '20px 14px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 0 }}>
+        {/* ── LEFT SIDEBAR: Health + Versions ──────────────────────────────────── */}
+        <div style={{ borderRight: `1px solid ${t.border}`, padding: '20px 14px', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
 
           <SectionHeader title="Services" t={t} />
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 24 }}>
@@ -405,31 +467,60 @@ export default function App() {
             ))}
           </div>
 
+          {/* Versions header */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, paddingBottom: 8, borderBottom: `1px solid ${t.border}` }}>
             <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', color: t.muted }}>Versions</span>
             <button onClick={saveVersion} disabled={saving} style={{ padding: '3px 10px', background: '#7c3aed', color: '#fff', border: 'none', borderRadius: 6, fontSize: 11, cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.5 : 1 }}>
               {saving ? '⟳' : '💾 Save'}
             </button>
           </div>
+
           {versions.length === 0 && <p style={{ color: t.muted, fontSize: 12 }}>No versions yet.</p>}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {versions.map(v => (
-              <div key={v.id} style={{ padding: '8px 10px', borderRadius: 7, background: t.surface2, border: `1px solid ${t.border}`, fontSize: 12 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
-                  <span style={{ fontFamily: 'monospace', fontWeight: 700, color: '#a78bfa', fontSize: 13 }}>{v.name}</span>
-                  <span style={{ color: t.muted, fontSize: 11 }}>{v.page_count}p</span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {versions.map(v => {
+              const isActing  = versionAction === v.id
+              const isProd    = v.status === 'production'
+              const isRetired = v.status === 'retired'
+              const isSaved   = v.status === 'saved'
+              return (
+                <div key={v.id} style={{ padding: '10px 10px', borderRadius: 8, background: isProd ? '#16a34a0d' : t.surface2, border: `1px solid ${isProd ? '#16a34a44' : t.border}`, fontSize: 12 }}>
+                  {/* Name + status badge */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                    <span style={{ fontFamily: 'monospace', fontWeight: 700, color: '#a78bfa', fontSize: 13 }}>{v.name}</span>
+                    <StatusBadge status={v.status} />
+                    <span style={{ color: t.muted, fontSize: 10, marginLeft: 'auto' }}>{v.page_count}p</span>
+                  </div>
+
+                  {/* Scores */}
+                  <div style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
+                    {v.score_avg != null && <span style={{ fontSize: 11, color: v.score_avg >= 7 ? t.up : v.score_avg >= 4 ? '#facc15' : t.down }}>🤖 {v.score_avg}/10</span>}
+                    {v.human_score_avg != null && <span style={{ fontSize: 11, color: v.human_score_avg >= 7 ? t.up : v.human_score_avg >= 4 ? '#facc15' : t.down }}>👤 {v.human_score_avg}/10</span>}
+                  </div>
+
+                  <div style={{ color: t.muted, fontSize: 10, marginBottom: 8 }}>{new Date(v.created_at).toLocaleString()}</div>
+
+                  {/* Action buttons */}
+                  <div style={{ display: 'flex', gap: 5 }}>
+                    {isProd && (
+                      <button onClick={() => undeployVersion(v.id, v.name)} disabled={isActing}
+                        style={{ flex: 1, padding: '4px 0', fontSize: 11, borderRadius: 5, border: `1px solid ${t.border}`, background: 'transparent', color: t.muted, cursor: isActing ? 'not-allowed' : 'pointer', opacity: isActing ? 0.5 : 1 }}>
+                        {isActing ? '⟳' : '⏏ Undeploy'}
+                      </button>
+                    )}
+                    {(isSaved || isRetired) && (
+                      <button onClick={() => isRetired ? rollbackVersion(v.id, v.name) : deployVersion(v.id, v.name)} disabled={isActing}
+                        style={{ flex: 1, padding: '4px 0', fontSize: 11, borderRadius: 5, border: 'none', background: isRetired ? '#b45309' : '#059669', color: '#fff', cursor: isActing ? 'not-allowed' : 'pointer', opacity: isActing ? 0.5 : 1 }}>
+                        {isActing ? '⟳' : isRetired ? '↩ Rollback' : '🚀 Deploy'}
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  {v.score_avg != null && <span style={{ fontSize: 11, color: v.score_avg >= 7 ? t.up : v.score_avg >= 4 ? '#facc15' : t.down }}>🤖 {v.score_avg}/10</span>}
-                  {v.human_score_avg != null && <span style={{ fontSize: 11, color: v.human_score_avg >= 7 ? t.up : v.human_score_avg >= 4 ? '#facc15' : t.down }}>👤 {v.human_score_avg}/10</span>}
-                </div>
-                <div style={{ color: t.muted, fontSize: 10, marginTop: 3 }}>{new Date(v.created_at).toLocaleString()}</div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         </div>
 
-        {/* ── CENTER: Ingest + KB + Eval ─────────────────────────────────────── */}
+        {/* ── CENTER: Ingest + KB + Eval ────────────────────────────────────────── */}
         <div style={{ padding: '20px 24px', overflowY: 'auto', borderRight: `1px solid ${t.border}` }}>
 
           <SectionHeader title="Ingest Knowledge" t={t} />
@@ -578,7 +669,7 @@ export default function App() {
           )}
         </div>
 
-        {/* ── RIGHT SIDEBAR: Past Runs ───────────────────────────────────────── */}
+        {/* ── RIGHT SIDEBAR: Past Runs ──────────────────────────────────────────── */}
         <div style={{ padding: '20px 16px', overflowY: 'auto' }}>
           <SectionHeader title="Past Runs" t={t} />
           {pastRuns.length === 0 && <p style={{ color: t.muted, fontSize: 12 }}>No runs yet.</p>}
@@ -626,7 +717,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* ── Bottom: Live Logs (full width) ────────────────────────────────────── */}
+      {/* ── Bottom: Live Logs (full width) ───────────────────────────────────────── */}
       <div style={{ borderTop: `1px solid ${t.border}`, background: t.surface, flexShrink: 0 }}>
         <div style={{ padding: '10px 24px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div onClick={() => setLogsCollapsed(c => !c)} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
