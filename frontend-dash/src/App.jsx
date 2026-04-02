@@ -166,8 +166,12 @@ export default function App() {
     } : prev)
   }
   const [expandedRun, setExpandedRun]   = useState(null)
+  const [versions, setVersions]         = useState([])
+  const [saving, setSaving]             = useState(false)
   const [expandedRunData, setExpandedRunData] = useState(null)
   const [generatedQs, setGeneratedQs]   = useState([])
+  const [quizCollapsed, setQuizCollapsed]       = useState(false)
+  const [resultsCollapsed, setResultsCollapsed] = useState(false)
   const [questionsLoading, setQuestionsLoading] = useState(true)
 
   // Logs state
@@ -188,6 +192,9 @@ export default function App() {
   }
   const fetchPages = async () => {
     try { setPages(await (await fetch(`${API}/pages`)).json()) } catch { setPages([]) }
+  }
+  const fetchVersions = async () => {
+    try { setVersions(await (await fetch(`${API}/versions`)).json()) } catch { setVersions([]) }
   }
   const fetchRuns = async () => {
     try { setPastRuns(await (await fetch(`${API}/eval/runs`)).json()) } catch { setPastRuns([]) }
@@ -220,7 +227,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    fetchHealth(); fetchPages(); fetchRuns(); fetchQuestions(); connectLogs()
+    fetchHealth(); fetchPages(); fetchRuns(); fetchVersions(); fetchQuestions(); connectLogs()
     const iv = setInterval(() => { fetchHealth(); fetchPages() }, 10000)
     return () => { clearInterval(iv); if (esRef.current) esRef.current.close() }
   }, [])
@@ -266,6 +273,18 @@ export default function App() {
     finally { setDeleting(null) }
   }
 
+  const saveVersion = async () => {
+    setSaving(true)
+    try {
+      const res  = await fetch(`${API}/versions/save`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail)
+      setMessage({ type: 'success', text: `✓ Version ${data.version_name} saved — ${data.page_count} pages${data.score_avg ? `, score ${data.score_avg}/10` : ''}` })
+      fetchVersions()
+    } catch (e) { setMessage({ type: 'error', text: `✗ ${e.message}` }) }
+    finally { setSaving(false) }
+  }
+
   const resetAll = async () => {
     setResetting(true)
     try {
@@ -273,6 +292,7 @@ export default function App() {
       setPages([])
       setGeneratedQs([])
       setPastRuns([])
+      setVersions([])
       setEvalResults([])
       setEvalSummary(null)
       setEvalProgress(null)
@@ -325,6 +345,8 @@ export default function App() {
     setEvalProgress('Starting evaluation...')
     setEvalResults([])
     setEvalSummary(null)
+    setResultsCollapsed(false)
+    setQuizCollapsed(true)
 
     try {
       const res    = await fetch(`${API}/eval/run`, { method: 'POST' })
@@ -479,6 +501,33 @@ export default function App() {
         ))}
       </div>
 
+      {/* Versions */}
+      <div style={card}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <div>
+            <h2 style={{ fontSize: 16, fontWeight: 500 }}>Versions</h2>
+            <p style={{ color: t.muted, fontSize: 12, marginTop: 2 }}>Snapshot the current knowledge base as an immutable version.</p>
+          </div>
+          <button onClick={saveVersion} disabled={saving}
+            style={{ padding: '8px 16px', background: '#7c3aed', color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.5 : 1, flexShrink: 0 }}>
+            {saving ? '⟳ Saving...' : '💾 Save Version'}
+          </button>
+        </div>
+        {versions.length === 0 && <p style={{ color: t.muted, fontSize: 13 }}>No versions saved yet.</p>}
+        {versions.map(v => (
+          <div key={v.id} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, padding: '10px 0', borderBottom: `1px solid ${t.border}` }}>
+            <span style={{ fontFamily: 'monospace', fontWeight: 600, color: '#a78bfa' }}>{v.name}</span>
+            <span style={{ flex: 1, color: t.muted, fontSize: 12 }}>{v.page_count} pages</span>
+            {v.score_avg != null && (
+              <span style={{ fontSize: 12, color: v.score_avg >= 7 ? t.up : v.score_avg >= 4 ? '#facc15' : t.down }}>
+                {v.score_avg}/10
+              </span>
+            )}
+            <span style={{ color: t.muted, fontSize: 11 }}>{new Date(v.created_at).toLocaleString()}</span>
+          </div>
+        ))}
+      </div>
+
       {/* Evaluation */}
       <div style={card}>
         <h2 style={{ fontSize: 16, fontWeight: 500, marginBottom: 4 }}>Evaluation</h2>
@@ -506,38 +555,52 @@ export default function App() {
         {/* Quiz bank */}
         {(questionsLoading || generatedQs.length > 0) && (
           <div style={{ marginBottom: 16 }}>
-            <p style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>Quiz Bank ({generatedQs.length} questions)</p>
-            {questionsLoading && <p style={{ color: t.muted, fontSize: 13 }}>Loading...</p>}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {generatedQs.map((q, i) => (
-                <div key={i} style={{ padding: '10px 14px', border: `1px solid ${t.border}`, borderRadius: 8, fontSize: 13 }}>
-                  <div style={{ color: t.muted, fontSize: 11, marginBottom: 4 }}>{q.page_title}</div>
-                  <div style={{ fontWeight: 500, marginBottom: 4 }}>Q: {q.question}</div>
-                  <div style={{ color: t.muted }}>A: {q.expected_answer}</div>
-                </div>
-              ))}
+            <div onClick={() => setQuizCollapsed(c => !c)}
+              style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer', marginBottom: quizCollapsed ? 0 : 8 }}>
+              <p style={{ fontSize: 13, fontWeight: 500, margin: 0 }}>Quiz Bank ({generatedQs.length} questions)</p>
+              <span style={{ fontSize: 11, color: t.muted }}>{quizCollapsed ? '▼ show' : '▲ hide'}</span>
             </div>
+            {!quizCollapsed && (
+              <>
+                {questionsLoading && <p style={{ color: t.muted, fontSize: 13 }}>Loading...</p>}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {generatedQs.map((q, i) => (
+                    <div key={i} style={{ padding: '10px 14px', border: `1px solid ${t.border}`, borderRadius: 8, fontSize: 13 }}>
+                      <div style={{ color: t.muted, fontSize: 11, marginBottom: 4 }}>{q.page_title}</div>
+                      <div style={{ fontWeight: 500, marginBottom: 4 }}>Q: {q.question}</div>
+                      <div style={{ color: t.muted }}>A: {q.expected_answer}</div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         )}
 
         {/* Live eval results */}
         {evalResults.length > 0 && (
           <div style={{ marginBottom: 16 }}>
-            <p style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>
-              {evalSummary ? `Results — avg score: ${evalSummary.score_avg}/10` : `Results (${evalResults.length} so far...)`}
-            </p>
-            {evalSummary && <ScoreBar score={evalSummary.score_avg} t={t} />}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 12 }}>
-              {evalResults.map((r, i) => (
-                <div key={i} style={{ padding: '12px 14px', border: `1px solid ${t.border}`, borderRadius: 8, fontSize: 13 }}>
-                  <div style={{ fontWeight: 500, marginBottom: 6 }}>Q{r.question_num}: {r.question}</div>
-                  <div style={{ color: t.muted, marginBottom: 3 }}>Expected: {r.expected_answer}</div>
-                  <div style={{ color: t.text, marginBottom: 8 }}>Got: {r.actual_answer}</div>
-                  <ScoreBar score={r.score} t={t} />
-                  {r.id && <ThumbsButtons resultId={r.id} humanScore={humanScores[r.id]} onVote={handleVote} t={t} />}
-                </div>
-              ))}
+            <div onClick={() => setResultsCollapsed(c => !c)}
+              style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer', marginBottom: 8 }}>
+              <p style={{ fontSize: 13, fontWeight: 500, margin: 0 }}>
+                {evalSummary ? `Results — avg score: ${evalSummary.score_avg}/10` : `Results (${evalResults.length} so far...)`}
+              </p>
+              <span style={{ fontSize: 11, color: t.muted }}>{resultsCollapsed ? '▼ show' : '▲ hide'}</span>
             </div>
+            {evalSummary && <ScoreBar score={evalSummary.score_avg} t={t} />}
+            {!resultsCollapsed && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 12 }}>
+                {evalResults.map((r, i) => (
+                  <div key={i} style={{ padding: '12px 14px', border: `1px solid ${t.border}`, borderRadius: 8, fontSize: 13 }}>
+                    <div style={{ fontWeight: 500, marginBottom: 6 }}>Q{r.question_num}: {r.question}</div>
+                    <div style={{ color: t.muted, marginBottom: 3 }}>Expected: {r.expected_answer}</div>
+                    <div style={{ color: t.text, marginBottom: 8 }}>Got: {r.actual_answer}</div>
+                    <ScoreBar score={r.score} t={t} />
+                    {r.id && <ThumbsButtons resultId={r.id} humanScore={humanScores[r.id]} onVote={handleVote} t={t} />}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

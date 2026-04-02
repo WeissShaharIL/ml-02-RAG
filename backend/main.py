@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import random
+import string
 import time
 import requests
 from typing import Optional, Generator
@@ -88,6 +89,35 @@ def init_db():
                 score           INTEGER,
                 human_score     INTEGER,
                 created_at      TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS versions (
+                id         SERIAL PRIMARY KEY,
+                name       TEXT NOT NULL UNIQUE,
+                score_avg  FLOAT,
+                page_count INTEGER NOT NULL DEFAULT 0,
+                status     TEXT NOT NULL DEFAULT 'saved',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS version_pages (
+                id               SERIAL PRIMARY KEY,
+                version_id       INTEGER REFERENCES versions(id) ON DELETE CASCADE,
+                original_page_id INTEGER,
+                title            TEXT NOT NULL,
+                url              TEXT,
+                content          TEXT NOT NULL,
+                created_at       TIMESTAMP
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS version_chunks (
+                id              SERIAL PRIMARY KEY,
+                version_page_id INTEGER REFERENCES version_pages(id) ON DELETE CASCADE,
+                position        INTEGER NOT NULL,
+                text            TEXT NOT NULL
             )
         """))
         # Migration: add human_score to existing tables if not present
@@ -531,18 +561,21 @@ Answer:"""
 
             # Step 3 — judge
             yield f"data: {json.dumps({'type': 'progress', 'step': 'judging', 'question_num': i+1, 'total': len(questions), 'question': q['question']})}\n\n"
-            judge_prompt = f"""You are an evaluation judge. Score the following answer compared to the expected answer.
+            judge_prompt = f"""You are an evaluation judge. Your job is to check whether the actual answer contains the correct information from the expected answer.
 
 Question: {q['question']}
 Expected answer: {q['expected_answer']}
 Actual answer: {actual_answer}
 
-Give a score from 0 to 10 where:
-- 10 = perfect match in meaning
-- 7-9 = correct but incomplete or slightly different wording
-- 4-6 = partially correct
-- 1-3 = mostly wrong but touches on the topic
-- 0 = completely wrong or irrelevant
+Scoring rules:
+- 10 = the actual answer contains the correct information, even if phrased differently or as a full sentence
+- 7-9 = mostly correct, minor omission or slight inaccuracy
+- 4-6 = partially correct, contains some right information but missing key parts
+- 1-3 = mostly wrong but tangentially related
+- 0 = completely wrong, irrelevant, or "I don't have information about that"
+
+IMPORTANT: Do NOT penalize for different phrasing, extra context, or full sentences vs fragments.
+Only check if the core factual content is correct.
 
 Respond with ONLY a single integer from 0 to 10. No explanation."""
             try:
@@ -581,6 +614,78 @@ Respond with ONLY a single integer from 0 to 10. No explanation."""
 
 
 
+
+@app.post("/versions/save")
+def save_version():
+    """Snapshot current pages + chunks into a new immutable version."""
+    with engine.connect() as conn:
+        # Load all current pages
+        pages = conn.execute(
+            text("SELECT id, title, url, content, created_at FROM pages ORDER BY created_at")
+        ).fetchall()
+
+        if not pages:
+            raise HTTPException(status_code=400, detail="No pages to snapshot. Ingest some pages first.")
+
+        # Get latest eval score if available
+        run = conn.execute(
+            text("SELECT score_avg FROM eval_runs WHERE score_avg IS NOT NULL ORDER BY created_at DESC LIMIT 1")
+        ).fetchone()
+        score_avg = run[0] if run else None
+
+        # Generate unique 7-char version name
+        while True:
+            name = ''.join(random.choices(string.ascii_lowercase + string.digits, k=7))
+            existing = conn.execute(text("SELECT id FROM versions WHERE name = :name"), {"name": name}).fetchone()
+            if not existing:
+                break
+
+        # Create version record
+        version_row = conn.execute(
+            text("INSERT INTO versions (name, score_avg, page_count) VALUES (:name, :score_avg, :page_count) RETURNING id"),
+            {"name": name, "score_avg": score_avg, "page_count": len(pages)}
+        )
+        version_id = version_row.fetchone()[0]
+
+        # Copy each page and its chunks
+        for page in pages:
+            vpage_row = conn.execute(
+                text("""INSERT INTO version_pages (version_id, original_page_id, title, url, content, created_at)
+                        VALUES (:version_id, :original_page_id, :title, :url, :content, :created_at) RETURNING id"""),
+                {"version_id": version_id, "original_page_id": page[0], "title": page[1],
+                 "url": page[2], "content": page[3], "created_at": page[4]}
+            )
+            vpage_id = vpage_row.fetchone()[0]
+
+            chunks = conn.execute(
+                text("SELECT position, text FROM chunks WHERE page_id = :page_id ORDER BY position"),
+                {"page_id": page[0]}
+            ).fetchall()
+
+            for chunk in chunks:
+                conn.execute(
+                    text("INSERT INTO version_chunks (version_page_id, position, text) VALUES (:vpage_id, :position, :text)"),
+                    {"vpage_id": vpage_id, "position": chunk[0], "text": chunk[1]}
+                )
+
+        conn.commit()
+
+    return {
+        "version_name": name,
+        "page_count":   len(pages),
+        "score_avg":    score_avg,
+    }
+
+
+@app.get("/versions")
+def list_versions():
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT id, name, score_avg, page_count, status, created_at FROM versions ORDER BY created_at DESC")
+        ).fetchall()
+    return [{"id": r[0], "name": r[1], "score_avg": r[2], "page_count": r[3], "status": r[4], "created_at": str(r[5])} for r in rows]
+
+
 @app.post("/reset")
 def reset_all():
     """Truncate all data tables. System stays running."""
@@ -591,6 +696,9 @@ def reset_all():
         conn.execute(text("TRUNCATE TABLE quiz_questions RESTART IDENTITY CASCADE"))
         conn.execute(text("TRUNCATE TABLE chunks         RESTART IDENTITY CASCADE"))
         conn.execute(text("TRUNCATE TABLE pages          RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE version_chunks RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE version_pages  RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE versions       RESTART IDENTITY CASCADE"))
         conn.commit()
     return {"status": "ok", "message": "All data wiped. System is ready for fresh ingestion."}
 
