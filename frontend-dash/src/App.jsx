@@ -152,6 +152,7 @@ export default function App() {
   // Eval state
   const [evalStatus, setEvalStatus]     = useState(null)   // 'generating' | 'running' | null
   const [evalNumQ, setEvalNumQ]         = useState(10)
+  const [generateNumQ, setGenerateNumQ] = useState(10)
   const [evalCycles, setEvalCycles]     = useState(1)
   const [evalProgress, setEvalProgress] = useState(null)   // current step text
   const [evalResults, setEvalResults]   = useState([])     // per-question results as they arrive
@@ -173,12 +174,14 @@ export default function App() {
   const [expandedRunData, setExpandedRunData] = useState(null)
   const [generatedQs, setGeneratedQs]   = useState([])
   const [quizCollapsed, setQuizCollapsed]       = useState(false)
+  const [quizSearch, setQuizSearch]             = useState('')
   const [confirmDeleteQ, setConfirmDeleteQ]     = useState(null)  // question id pending delete
   const [resultsCollapsed, setResultsCollapsed] = useState(false)
   const [questionsLoading, setQuestionsLoading] = useState(true)
 
   // Logs state
   const [logLines, setLogLines]         = useState([])
+  const [logsCollapsed, setLogsCollapsed] = useState(false)
   const [logPaused, setLogPaused]       = useState(false)
   const [logFilter, setLogFilter]       = useState('all')
   const [logConnected, setLogConnected] = useState(false)
@@ -292,7 +295,7 @@ export default function App() {
       const res  = await fetch(`${API}/versions/save`, { method: 'POST' })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail)
-      setMessage({ type: 'success', text: `✓ Version ${data.version_name} saved — ${data.page_count} pages${data.score_avg ? `, score ${data.score_avg}/10` : ''}` })
+      setMessage({ type: 'success', text: `✓ Version ${data.version_name} saved — ${data.page_count} pages${data.score_avg ? ` 🤖 ${data.score_avg}/10` : ''}${data.human_score_avg != null ? ` 👤 ${data.human_score_avg}/10` : ''}${data.eval_results_saved ? ` · ${data.eval_results_saved} eval results snapshotted` : ''}` })
       fetchVersions()
     } catch (e) { setMessage({ type: 'error', text: `✗ ${e.message}` }) }
     finally { setSaving(false) }
@@ -322,10 +325,9 @@ export default function App() {
   const runGenerate = async () => {
     setEvalStatus('generating')
     setEvalProgress('Starting...')
-    setGeneratedQs([])
 
     try {
-      const res    = await fetch(`${API}/eval/generate`, { method: 'POST' })
+      const res    = await fetch(`${API}/eval/generate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ num_questions: parseInt(generateNumQ) || 10 }) })
       const reader = res.body.getReader()
       const dec    = new TextDecoder()
       let   buf    = ''
@@ -340,7 +342,7 @@ export default function App() {
           const p = JSON.parse(line.slice(6))
           if (p.type === 'status')   setEvalProgress(p.text)
           if (p.type === 'warning')  setEvalProgress(`⚠ ${p.text}`)
-          if (p.type === 'question') setGeneratedQs(prev => [...prev, { question: p.question, expected_answer: p.expected_answer, page_title: p.page_title }])
+          if (p.type === 'question') setGeneratedQs(prev => [...prev, { id: p.id, question: p.question, expected_answer: p.expected_answer, page_title: p.page_title }])
           if (p.type === 'error')    setEvalProgress(`✗ ${p.text}`)
           if (p.type === 'cycle_done') {
             setEvalSummary({ score_avg: p.score_avg, total: p.total })
@@ -367,7 +369,9 @@ export default function App() {
     setQuizCollapsed(true)
 
     try {
-      const res    = await fetch(`${API}/eval/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ num_questions: evalNumQ, cycles: evalCycles }) })
+      const effectiveNumQ = Math.min(parseInt(evalNumQ) || 10, generatedQs.length || parseInt(evalNumQ) || 10)
+      const effectiveCycles = Math.max(1, parseInt(evalCycles) || 1)
+      const res    = await fetch(`${API}/eval/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ num_questions: effectiveNumQ, cycles: effectiveCycles }) })
       const reader = res.body.getReader()
       const dec    = new TextDecoder()
       let   buf    = ''
@@ -543,7 +547,12 @@ export default function App() {
             <span style={{ flex: 1, color: t.muted, fontSize: 12 }}>{v.page_count} pages</span>
             {v.score_avg != null && (
               <span style={{ fontSize: 12, color: v.score_avg >= 7 ? t.up : v.score_avg >= 4 ? '#facc15' : t.down }}>
-                {v.score_avg}/10
+                🤖 {v.score_avg}/10
+              </span>
+            )}
+            {v.human_score_avg != null && (
+              <span style={{ fontSize: 12, color: v.human_score_avg >= 7 ? t.up : v.human_score_avg >= 4 ? '#facc15' : t.down }}>
+                👤 {v.human_score_avg}/10
               </span>
             )}
             <span style={{ color: t.muted, fontSize: 11 }}>{new Date(v.created_at).toLocaleString()}</span>
@@ -562,23 +571,39 @@ export default function App() {
             style={btn(!!evalStatus, '#7c3aed')}>
             {evalStatus === 'generating' ? '⟳ Generating...' : '⚡ Generate Questions'}
           </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: t.muted }}>
+            <span>Generate:</span>
+            <input type="text" inputMode="numeric" value={generateNumQ}
+              onChange={e => setGenerateNumQ(e.target.value)}
+              onBlur={e => setGenerateNumQ(Math.max(1, parseInt(e.target.value) || 1))}
+              style={{ width: 44, padding: '4px 8px', borderRadius: 6, border: `1px solid ${t.border}`, background: t.inputBg, color: t.text, fontSize: 13, textAlign: 'center' }} />
+          </div>
           <button onClick={runEval} disabled={!!evalStatus}
             style={btn(!!evalStatus, '#059669')}>
             {evalStatus === 'running' ? '⟳ Evaluating...' : '▶ Run Evaluation'}
           </button>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: t.muted }}>
             <span>Questions:</span>
-            <input type="number" min={1} max={10} value={evalNumQ}
-              onChange={e => setEvalNumQ(Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
-              style={{ width: 48, padding: '4px 8px', borderRadius: 6, border: `1px solid ${t.border}`, background: t.inputBg, color: t.text, fontSize: 13, textAlign: 'center' }} />
+            <input type="text" inputMode="numeric" value={evalNumQ}
+              onChange={e => setEvalNumQ(e.target.value)}
+              onBlur={e => setEvalNumQ(Math.max(1, parseInt(e.target.value) || 1))}
+              style={{ width: 44, padding: '4px 8px', borderRadius: 6, border: `1px solid ${t.border}`, background: t.inputBg, color: t.text, fontSize: 13, textAlign: 'center', MozAppearance: 'textfield' }} />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: t.muted }}>
             <span>Cycles:</span>
-            <input type="number" min={1} max={5} value={evalCycles}
-              onChange={e => setEvalCycles(Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
-              style={{ width: 48, padding: '4px 8px', borderRadius: 6, border: `1px solid ${t.border}`, background: t.inputBg, color: t.text, fontSize: 13, textAlign: 'center' }} />
+            <input type="text" inputMode="numeric" value={evalCycles}
+              onChange={e => setEvalCycles(e.target.value)}
+              onBlur={e => setEvalCycles(Math.max(1, parseInt(e.target.value) || 1))}
+              style={{ width: 44, padding: '4px 8px', borderRadius: 6, border: `1px solid ${t.border}`, background: t.inputBg, color: t.text, fontSize: 13, textAlign: 'center' }} />
           </div>
         </div>
+
+        {/* Eval config warning */}
+        {generatedQs.length > 0 && parseInt(evalNumQ) > generatedQs.length && (
+          <p style={{ fontSize: 12, color: '#facc15', marginBottom: 8, marginTop: -8 }}>
+            Only {generatedQs.length} questions available — will use {generatedQs.length}
+          </p>
+        )}
 
         {/* Live progress */}
         {evalProgress && (
@@ -590,16 +615,31 @@ export default function App() {
         {/* Quiz bank */}
         {(questionsLoading || generatedQs.length > 0) && (
           <div style={{ marginBottom: 16 }}>
-            <div onClick={() => setQuizCollapsed(c => !c)}
-              style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer', marginBottom: quizCollapsed ? 0 : 8 }}>
-              <p style={{ fontSize: 13, fontWeight: 500, margin: 0 }}>Quiz Bank ({generatedQs.length} questions)</p>
-              <span style={{ fontSize: 11, color: t.muted }}>{quizCollapsed ? '▼ show' : '▲ hide'}</span>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: quizCollapsed ? 0 : 8 }}>
+              <div onClick={() => setQuizCollapsed(c => !c)} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                <p style={{ fontSize: 13, fontWeight: 500, margin: 0 }}>Quiz Bank ({generatedQs.length} questions)</p>
+                <span style={{ fontSize: 11, color: t.muted }}>{quizCollapsed ? '▼ show' : '▲ hide'}</span>
+              </div>
+              {!quizCollapsed && (
+                <input
+                  type="text"
+                  placeholder="Search questions..."
+                  value={quizSearch}
+                  onChange={e => setQuizSearch(e.target.value)}
+                  style={{ padding: '4px 10px', borderRadius: 6, border: `1px solid ${t.border}`, background: t.inputBg, color: t.text, fontSize: 12, outline: 'none', width: 180 }}
+                />
+              )}
             </div>
             {!quizCollapsed && (
               <>
                 {questionsLoading && <p style={{ color: t.muted, fontSize: 13 }}>Loading...</p>}
+                {!questionsLoading && quizSearch && (
+                  <p style={{ color: t.muted, fontSize: 12, marginBottom: 8 }}>
+                    {generatedQs.filter(q => q.question.toLowerCase().includes(quizSearch.toLowerCase()) || q.expected_answer.toLowerCase().includes(quizSearch.toLowerCase()) || q.page_title.toLowerCase().includes(quizSearch.toLowerCase())).length} of {generatedQs.length} shown
+                  </p>
+                )}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {generatedQs.map((q, i) => (
+                  {generatedQs.filter(q => !quizSearch || q.question.toLowerCase().includes(quizSearch.toLowerCase()) || q.expected_answer.toLowerCase().includes(quizSearch.toLowerCase()) || q.page_title.toLowerCase().includes(quizSearch.toLowerCase())).map((q, i) => (
                     <div key={q.id || i} style={{ padding: '10px 14px', border: `1px solid ${t.border}`, borderRadius: 8, fontSize: 13 }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 4 }}>
                         <div style={{ color: t.muted, fontSize: 11 }}>{q.page_title}</div>
@@ -666,20 +706,45 @@ export default function App() {
                     style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', border: `1px solid ${t.border}`, borderRadius: 8, cursor: 'pointer', fontSize: 13 }}>
                     <span style={{ color: t.muted, fontSize: 11 }}>#{run.id}</span>
                     <span style={{ flex: 1 }}>{new Date(run.created_at).toLocaleString()}</span>
-                    <span style={{ fontWeight: 600, color: run.score_avg >= 7 ? t.up : run.score_avg >= 4 ? '#facc15' : t.down }}>{run.score_avg}/10</span>
+                    <span style={{ fontWeight: 600, color: run.score_avg >= 7 ? t.up : run.score_avg >= 4 ? '#facc15' : t.down }}>🤖 {run.score_avg}/10</span>
+                    {run.human_score_avg != null && (
+                      <span style={{ fontWeight: 600, color: run.human_score_avg >= 7 ? t.up : run.human_score_avg >= 4 ? '#facc15' : t.down }}>
+                        👤 {run.human_score_avg}/10 <span style={{ fontWeight: 400, fontSize: 10 }}>({run.human_rated_count} rated)</span>
+                      </span>
+                    )}
                     {run.duration_seconds != null && (
                       <span style={{ color: t.muted, fontSize: 11 }}>{run.duration_seconds >= 60 ? `${Math.floor(run.duration_seconds/60)}m ${run.duration_seconds%60}s` : `${run.duration_seconds}s`}</span>
+                    )}
+                    {run.judge_model && run.judge_model !== run.ollama_model && (
+                      <span style={{ fontSize: 10, color: t.muted, fontFamily: 'monospace' }} title={`Answer: ${run.ollama_model} / Judge: ${run.judge_model}`}>⚖ {run.judge_model.split(':')[0]}</span>
                     )}
                     <span style={{ color: t.muted, fontSize: 11 }}>{expandedRun === run.id ? '▲' : '▼'}</span>
                   </div>
                   {expandedRun === run.id && expandedRunData && (
                     <div style={{ padding: '12px 14px', border: `1px solid ${t.border}`, borderTop: 'none', borderRadius: '0 0 8px 8px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      <div style={{ display: 'flex', gap: 16, fontSize: 13, paddingBottom: 10, borderBottom: `1px solid ${t.border}`, flexWrap: 'wrap' }}>
+                        <span>🤖 Ollama: <strong>{expandedRunData.score_avg}/10</strong></span>
+                        {expandedRunData.human_score_avg != null && (
+                          <span>👤 Human: <strong style={{ color: expandedRunData.human_score_avg >= 7 ? t.up : expandedRunData.human_score_avg >= 4 ? '#facc15' : t.down }}>{expandedRunData.human_score_avg}/10</strong> ({expandedRunData.human_rated_count} rated)</span>
+                        )}
+                        {expandedRunData.ollama_model && (
+                          <span style={{ color: t.muted, fontSize: 11, fontFamily: 'monospace' }}>answer: {expandedRunData.ollama_model}</span>
+                        )}
+                        {expandedRunData.judge_model && (
+                          <span style={{ color: t.muted, fontSize: 11, fontFamily: 'monospace' }}>judge: {expandedRunData.judge_model}</span>
+                        )}
+                      </div>
                       {expandedRunData.results.map((r, i) => (
                         <div key={i} style={{ fontSize: 13, paddingBottom: 10, borderBottom: i < expandedRunData.results.length - 1 ? `1px solid ${t.border}` : 'none' }}>
                           <div style={{ fontWeight: 500, marginBottom: 4 }}>Q: {r.question}</div>
                           <div style={{ color: t.muted, marginBottom: 2, fontSize: 12 }}>Expected: {r.expected_answer}</div>
                           <div style={{ color: t.text, marginBottom: 6, fontSize: 12 }}>Got: {r.actual_answer}</div>
-                          <ScoreBar score={r.score} t={t} />
+                          <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 4 }}>
+                            <div style={{ flex: 1 }}><span style={{ fontSize: 11, color: t.muted, marginRight: 6 }}>🤖</span><ScoreBar score={r.score} t={t} /></div>
+                            {r.human_score != null && (
+                              <div style={{ flex: 1 }}><span style={{ fontSize: 11, color: t.muted, marginRight: 6 }}>👤</span><ScoreBar score={r.human_score} t={t} /></div>
+                            )}
+                          </div>
                           <ThumbsButtons resultId={r.id} humanScore={r.human_score} onVote={handleVote} t={t} />
                         </div>
                       ))}
@@ -695,7 +760,7 @@ export default function App() {
       {/* Live Logs */}
       <div style={card}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div onClick={() => setLogsCollapsed(c => !c)} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
             <h2 style={{ fontSize: 16, fontWeight: 500 }}>Live Logs</h2>
             <span style={{ fontSize: 11, padding: '2px 7px', borderRadius: 10, background: logConnected ? '#16a34a22' : '#dc262622', color: logConnected ? t.up : t.down }}>
               {logConnected ? '● live' : '○ reconnecting'}
@@ -708,27 +773,32 @@ export default function App() {
             </button>
             <button onClick={() => setLogLines([])}
               style={{ padding: '4px 10px', borderRadius: 6, border: `1px solid ${t.border}`, background: t.surface, color: t.muted, fontSize: 12, cursor: 'pointer' }}>Clear</button>
+            <span onClick={() => setLogsCollapsed(c => !c)} style={{ fontSize: 11, color: t.muted, cursor: 'pointer', padding: '4px 6px' }}>{logsCollapsed ? '▼ show' : '▲ hide'}</span>
           </div>
         </div>
-        <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
-          {['all', 'backend', 'ollama', 'postgres'].map(f => (
-            <button key={f} onClick={() => setLogFilter(f)}
-              style={{ padding: '3px 10px', borderRadius: 6, fontSize: 12, cursor: 'pointer', border: `1px solid ${logFilter === f ? (SERVICE_COLORS[f] || t.border) : t.border}`, background: logFilter === f ? (SERVICE_COLORS[f] ? SERVICE_COLORS[f] + '22' : t.surface) : 'transparent', color: logFilter === f ? (SERVICE_COLORS[f] || t.text) : t.muted }}>
-              {f}
-            </button>
-          ))}
-        </div>
-        <div ref={logContainerRef} style={{ height: 320, overflowY: 'auto', background: t.logBg, borderRadius: 8, border: `1px solid ${t.border}`, padding: '10px 14px', fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }}>
-          {visibleLines.length === 0 && <span style={{ color: t.muted }}>Waiting for logs...</span>}
-          {visibleLines.map(({ id, service, line }) => (
-            <div key={id} style={{ display: 'flex', gap: 8, wordBreak: 'break-all' }}>
-              <span style={{ color: SERVICE_COLORS[service], flexShrink: 0, userSelect: 'none' }}>[{service}]</span>
-              <span style={{ color: t.text }}>{line}</span>
+        {!logsCollapsed && (
+          <>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+              {['all', 'backend', 'ollama', 'postgres'].map(f => (
+                <button key={f} onClick={() => setLogFilter(f)}
+                  style={{ padding: '3px 10px', borderRadius: 6, fontSize: 12, cursor: 'pointer', border: `1px solid ${logFilter === f ? (SERVICE_COLORS[f] || t.border) : t.border}`, background: logFilter === f ? (SERVICE_COLORS[f] ? SERVICE_COLORS[f] + '22' : t.surface) : 'transparent', color: logFilter === f ? (SERVICE_COLORS[f] || t.text) : t.muted }}>
+                  {f}
+                </button>
+              ))}
             </div>
-          ))}
-          <div ref={logBottomRef} />
-        </div>
-        {logPaused && <p style={{ fontSize: 12, color: t.muted, marginTop: 6 }}>⏸ Paused — {logLines.length} lines buffered.</p>}
+            <div ref={logContainerRef} style={{ height: 320, overflowY: 'auto', background: t.logBg, borderRadius: 8, border: `1px solid ${t.border}`, padding: '10px 14px', fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }}>
+              {visibleLines.length === 0 && <span style={{ color: t.muted }}>Waiting for logs...</span>}
+              {visibleLines.map(({ id, service, line }) => (
+                <div key={id} style={{ display: 'flex', gap: 8, wordBreak: 'break-all' }}>
+                  <span style={{ color: SERVICE_COLORS[service], flexShrink: 0, userSelect: 'none' }}>[{service}]</span>
+                  <span style={{ color: t.text }}>{line}</span>
+                </div>
+              ))}
+              <div ref={logBottomRef} />
+            </div>
+            {logPaused && <p style={{ fontSize: 12, color: t.muted, marginTop: 6 }}>⏸ Paused — {logLines.length} lines buffered.</p>}
+          </>
+        )}
       </div>
 
     </div>

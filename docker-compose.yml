@@ -36,6 +36,8 @@ services:
     environment:
       DATABASE_URL: postgresql://rag:rag@postgres:5432/rag
       OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      OLLAMA_JUDGE_MODEL: ${OLLAMA_JUDGE_MODEL:-llama3.2:3b}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:

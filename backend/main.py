@@ -18,7 +18,8 @@ from bs4 import BeautifulSoup
 # ── Config ─────────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL")
 OLLAMA_URL   = os.getenv("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_MODEL = "llama3.2:3b"
+OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+OLLAMA_JUDGE_MODEL = os.getenv("OLLAMA_JUDGE_MODEL", OLLAMA_MODEL)
 CHUNK_WORDS  = 300
 TOP_K        = 2
 EVAL_QUESTIONS = 10
@@ -73,9 +74,16 @@ def init_db():
                 id               SERIAL PRIMARY KEY,
                 score_avg        FLOAT,
                 duration_seconds INTEGER,
+                ollama_model     TEXT,
+                judge_model      TEXT,
                 created_at       TIMESTAMP DEFAULT NOW()
             )
         """))
+        try:
+            conn.execute(text("ALTER TABLE eval_runs ADD COLUMN IF NOT EXISTS ollama_model TEXT"))
+            conn.execute(text("ALTER TABLE eval_runs ADD COLUMN IF NOT EXISTS judge_model TEXT"))
+        except:
+            pass
         try:
             conn.execute(text("ALTER TABLE eval_runs ADD COLUMN IF NOT EXISTS duration_seconds INTEGER"))
         except:
@@ -94,10 +102,11 @@ def init_db():
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS versions (
                 id         SERIAL PRIMARY KEY,
-                name       TEXT NOT NULL UNIQUE,
-                score_avg  FLOAT,
-                page_count INTEGER NOT NULL DEFAULT 0,
-                status     TEXT NOT NULL DEFAULT 'saved',
+                name            TEXT NOT NULL UNIQUE,
+                score_avg       FLOAT,
+                human_score_avg FLOAT,
+                page_count      INTEGER NOT NULL DEFAULT 0,
+                status          TEXT NOT NULL DEFAULT 'saved',
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """))
@@ -120,6 +129,22 @@ def init_db():
                 text            TEXT NOT NULL
             )
         """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS version_eval_results (
+                id               SERIAL PRIMARY KEY,
+                version_id       INTEGER REFERENCES versions(id) ON DELETE CASCADE,
+                question         TEXT NOT NULL,
+                expected_answer  TEXT NOT NULL,
+                actual_answer    TEXT,
+                ollama_score     INTEGER,
+                human_score      INTEGER,
+                created_at       TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        try:
+            conn.execute(text("ALTER TABLE versions ADD COLUMN IF NOT EXISTS human_score_avg FLOAT"))
+        except:
+            pass
         # Migration: add human_score to existing tables if not present
         try:
             conn.execute(text("ALTER TABLE eval_results ADD COLUMN IF NOT EXISTS human_score INTEGER"))
@@ -131,6 +156,15 @@ def init_db():
 def startup():
     init_db()
     print("DB initialized.")
+    print(f"Main model:  {OLLAMA_MODEL}")
+    print(f"Judge model: {OLLAMA_JUDGE_MODEL}")
+    if OLLAMA_JUDGE_MODEL != OLLAMA_MODEL:
+        print(f"Pulling judge model {OLLAMA_JUDGE_MODEL}...")
+        try:
+            requests.post(f"{OLLAMA_URL}/api/pull", json={"name": OLLAMA_JUDGE_MODEL}, timeout=(10, 600))
+            print(f"Judge model {OLLAMA_JUDGE_MODEL} ready.")
+        except Exception as e:
+            print(f"Warning: could not pull judge model: {e}")
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def chunk_text(content: str, chunk_words: int = CHUNK_WORDS) -> list[str]:
@@ -205,9 +239,9 @@ def bm25_retrieve(question: str, chunks: list[str]) -> str:
     return " ".join(chunks[i] for i in top_indices)
 
 
-def call_ollama_sync(prompt: str, timeout: int = 600) -> str:
+def call_ollama_sync(prompt: str, timeout: int = 600, model: str = None) -> str:
     """Blocking Ollama call. timeout is the read timeout in seconds (CPU can be slow)."""
-    payload  = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+    payload  = {"model": model or OLLAMA_MODEL, "prompt": prompt, "stream": False}
     response = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=(10, timeout))
     response.raise_for_status()
     return response.json()["response"].strip()
@@ -248,6 +282,9 @@ class IngestTextRequest(BaseModel):
 
 class AskRequest(BaseModel):
     question: str
+
+class EvalGenerateRequest(BaseModel):
+    num_questions: int = 10   # how many questions to generate
 
 class EvalRunRequest(BaseModel):
     num_questions: int = 10   # how many questions to use (1–10)
@@ -400,17 +437,29 @@ def delete_question(question_id: int):
 @app.get("/eval/runs")
 def list_runs():
     with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT id, score_avg, duration_seconds, created_at FROM eval_runs ORDER BY created_at DESC")
-        ).fetchall()
-    return [{"id": r[0], "score_avg": r[1], "duration_seconds": r[2], "created_at": str(r[3])} for r in rows]
+        rows = conn.execute(text("""
+            SELECT
+                er.id,
+                er.score_avg,
+                er.duration_seconds,
+                er.created_at,
+                ROUND(AVG(res.human_score)::numeric, 1) AS human_score_avg,
+                COUNT(res.human_score)                  AS human_rated_count
+            FROM eval_runs er
+            LEFT JOIN eval_results res ON res.run_id = er.id AND res.human_score IS NOT NULL
+            GROUP BY er.id
+            ORDER BY er.created_at DESC
+        """)).fetchall()
+    return [{"id": r[0], "score_avg": r[1], "duration_seconds": r[2], "created_at": str(r[3]),
+             "human_score_avg": float(r[4]) if r[4] is not None else None,
+             "human_rated_count": r[5], "ollama_model": r[6], "judge_model": r[7]} for r in rows]
 
 
 @app.get("/eval/runs/{run_id}")
 def get_run(run_id: int):
     with engine.connect() as conn:
         run = conn.execute(
-            text("SELECT id, score_avg, duration_seconds, created_at FROM eval_runs WHERE id = :id"),
+            text("SELECT id, score_avg, duration_seconds, created_at, ollama_model, judge_model FROM eval_runs WHERE id = :id"),
             {"id": run_id}
         ).fetchone()
         if not run:
@@ -425,8 +474,16 @@ def get_run(run_id: int):
             """),
             {"run_id": run_id}
         ).fetchall()
+    with engine.connect() as conn2:
+        human = conn2.execute(text("""
+            SELECT ROUND(AVG(human_score)::numeric, 1), COUNT(human_score)
+            FROM eval_results WHERE run_id = :id AND human_score IS NOT NULL
+        """), {"id": run_id}).fetchone()
     return {
         "id": run[0], "score_avg": run[1], "duration_seconds": run[2], "created_at": str(run[3]),
+        "ollama_model": run[4], "judge_model": run[5],
+        "human_score_avg": float(human[0]) if human[0] is not None else None,
+        "human_rated_count": human[1],
         "results": [
             {"id": r[0], "question": r[1], "expected_answer": r[2], "actual_answer": r[3], "score": r[4], "human_score": r[5]}
             for r in results
@@ -451,14 +508,16 @@ def patch_result(result_id: int, body: dict):
     return {"id": result_id, "human_score": human_score}
 
 @app.post("/eval/generate")
-def eval_generate():
-    """Pick 5 random chunks from the KB, generate a Q+A for each, save to quiz_questions."""
+def eval_generate(req: EvalGenerateRequest = EvalGenerateRequest()):
+    """Generate N questions from random chunks and ADD them to the quiz bank."""
+    n = max(1, min(req.num_questions, 50))  # cap at 50
+
     def generate():
         yield f"data: {json.dumps({'type': 'status', 'text': 'Loading knowledge base...'})}\n\n"
 
         all_chunks = load_chunks_with_page()
-        if len(all_chunks) < EVAL_QUESTIONS:
-            yield f"data: {json.dumps({'type': 'error', 'text': 'Not enough chunks in knowledge base. Ingest more pages first.'})}\n\n"
+        if len(all_chunks) < n:
+            yield f"data: {json.dumps({'type': 'error', 'text': f'Not enough chunks ({len(all_chunks)}) to generate {n} questions.'})}\n\n"
             return
 
         # Balanced sampling: pick chunks evenly across pages
@@ -470,7 +529,7 @@ def eval_generate():
         page_ids = list(by_page.keys())
         random.shuffle(page_ids)
         idx = 0
-        while len(selected) < EVAL_QUESTIONS:
+        while len(selected) < n:
             page_id = page_ids[idx % len(page_ids)]
             if by_page[page_id]:
                 chunk = random.choice(by_page[page_id])
@@ -482,7 +541,7 @@ def eval_generate():
 
         for i, chunk in enumerate(selected):
             page_label = chunk["title"][:40]
-            yield f"data: {json.dumps({'type': 'status', 'text': f'Generating question {i+1}/{EVAL_QUESTIONS} (from: {page_label})...'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'text': f'Generating question {i+1}/{n} (from: {page_label})...'})}\n\n"
 
             prompt = f"""You are a quiz generator. Read the following text and generate exactly ONE clear factual question and its answer.
 
@@ -533,27 +592,32 @@ def eval_run(req: EvalRunRequest = EvalRunRequest()):
     cycles        = max(1, min(req.cycles, 5))
 
     def generate():
-        # Load questions
+        # Load all available questions for random sampling each cycle
         with engine.connect() as conn:
-            rows = conn.execute(
-                text("SELECT id, question, expected_answer FROM quiz_questions ORDER BY created_at DESC LIMIT :n"),
-                {"n": num_questions}
+            all_rows = conn.execute(
+                text("SELECT id, question, expected_answer FROM quiz_questions ORDER BY created_at DESC")
             ).fetchall()
-        questions = [{"id": r[0], "question": r[1], "expected_answer": r[2]} for r in rows]
+        all_questions = [{"id": r[0], "question": r[1], "expected_answer": r[2]} for r in all_rows]
 
-        if not questions:
+        if not all_questions:
             yield f"data: {json.dumps({'type': 'error', 'text': 'No questions found. Generate questions first.'})}\n\n"
             return
 
-        yield f"data: {json.dumps({'type': 'status', 'text': f'Starting {cycles} evaluation cycle(s) of {len(questions)} questions each...'})}\n\n"
+        yield f"data: {json.dumps({'type': 'status', 'text': f'Starting {cycles} evaluation cycle(s) of {num_questions} questions each...'})}\n\n"
 
         for cycle in range(cycles):
+            # Re-sample randomly on each cycle
+            questions = random.sample(all_questions, min(num_questions, len(all_questions)))
+
             if cycles > 1:
                 yield f"data: {json.dumps({'type': 'status', 'text': f'Cycle {cycle+1}/{cycles}...'})}\n\n"
 
             # Create eval run record
             with engine.connect() as conn:
-                result = conn.execute(text("INSERT INTO eval_runs (score_avg) VALUES (NULL) RETURNING id"))
+                result = conn.execute(
+                    text("INSERT INTO eval_runs (score_avg, ollama_model, judge_model) VALUES (NULL, :ollama_model, :judge_model) RETURNING id"),
+                    {"ollama_model": OLLAMA_MODEL, "judge_model": OLLAMA_JUDGE_MODEL}
+                )
                 run_id = result.fetchone()[0]
                 conn.commit()
 
@@ -605,7 +669,7 @@ def eval_run(req: EvalRunRequest = EvalRunRequest()):
 
     Respond with ONLY a single integer from 0 to 10. No explanation."""
                 try:
-                    score_raw = call_ollama_sync(judge_prompt, timeout=600)
+                    score_raw = call_ollama_sync(judge_prompt, timeout=600, model=OLLAMA_JUDGE_MODEL)
                     score     = int(re.search(r'\d+', score_raw).group())
                     score     = max(0, min(10, score))
                 except:
@@ -655,11 +719,21 @@ def save_version():
         if not pages:
             raise HTTPException(status_code=400, detail="No pages to snapshot. Ingest some pages first.")
 
-        # Get latest eval score if available
+        # Get latest eval scores (Ollama + human) if available
         run = conn.execute(
-            text("SELECT score_avg FROM eval_runs WHERE score_avg IS NOT NULL ORDER BY created_at DESC LIMIT 1")
+            text("""
+                SELECT er.score_avg,
+                       ROUND(AVG(res.human_score)::numeric, 1),
+                       COUNT(res.human_score)
+                FROM eval_runs er
+                LEFT JOIN eval_results res ON res.run_id = er.id AND res.human_score IS NOT NULL
+                WHERE er.score_avg IS NOT NULL
+                GROUP BY er.id
+                ORDER BY er.created_at DESC LIMIT 1
+            """)
         ).fetchone()
-        score_avg = run[0] if run else None
+        score_avg       = run[0] if run else None
+        human_score_avg = float(run[1]) if run and run[1] is not None else None
 
         # Generate unique 7-char version name
         while True:
@@ -670,8 +744,8 @@ def save_version():
 
         # Create version record
         version_row = conn.execute(
-            text("INSERT INTO versions (name, score_avg, page_count) VALUES (:name, :score_avg, :page_count) RETURNING id"),
-            {"name": name, "score_avg": score_avg, "page_count": len(pages)}
+            text("INSERT INTO versions (name, score_avg, human_score_avg, page_count) VALUES (:name, :score_avg, :human_score_avg, :page_count) RETURNING id"),
+            {"name": name, "score_avg": score_avg, "human_score_avg": human_score_avg, "page_count": len(pages)}
         )
         version_id = version_row.fetchone()[0]
 
@@ -696,22 +770,56 @@ def save_version():
                     {"vpage_id": vpage_id, "position": chunk[0], "text": chunk[1]}
                 )
 
+        # Snapshot latest eval results (human + ollama scores) at save time
+        eval_rows = conn.execute(text("""
+            SELECT q.question, q.expected_answer, er.actual_answer, er.score, er.human_score
+            FROM eval_results er
+            JOIN quiz_questions q ON er.question_id = q.id
+            WHERE er.run_id = (
+                SELECT id FROM eval_runs WHERE score_avg IS NOT NULL ORDER BY created_at DESC LIMIT 1
+            )
+            ORDER BY er.id
+        """)).fetchall()
+
+        for er in eval_rows:
+            conn.execute(
+                text("""INSERT INTO version_eval_results
+                        (version_id, question, expected_answer, actual_answer, ollama_score, human_score)
+                        VALUES (:version_id, :question, :expected_answer, :actual_answer, :ollama_score, :human_score)"""),
+                {"version_id": version_id, "question": er[0], "expected_answer": er[1],
+                 "actual_answer": er[2], "ollama_score": er[3], "human_score": er[4]}
+            )
+
         conn.commit()
 
     return {
-        "version_name": name,
-        "page_count":   len(pages),
-        "score_avg":    score_avg,
+        "version_name":      name,
+        "page_count":        len(pages),
+        "score_avg":         score_avg,
+        "human_score_avg":   human_score_avg,
+        "eval_results_saved": len(eval_rows),
     }
+
+
+@app.get("/versions/{version_id}/eval")
+def get_version_eval(version_id: int):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""SELECT question, expected_answer, actual_answer, ollama_score, human_score
+                    FROM version_eval_results WHERE version_id = :id ORDER BY id"""),
+            {"id": version_id}
+        ).fetchall()
+    return [{"question": r[0], "expected_answer": r[1], "actual_answer": r[2],
+             "ollama_score": r[3], "human_score": r[4]} for r in rows]
 
 
 @app.get("/versions")
 def list_versions():
     with engine.connect() as conn:
         rows = conn.execute(
-            text("SELECT id, name, score_avg, page_count, status, created_at FROM versions ORDER BY created_at DESC")
+            text("SELECT id, name, score_avg, human_score_avg, page_count, status, created_at FROM versions ORDER BY created_at DESC")
         ).fetchall()
-    return [{"id": r[0], "name": r[1], "score_avg": r[2], "page_count": r[3], "status": r[4], "created_at": str(r[5])} for r in rows]
+    return [{"id": r[0], "name": r[1], "score_avg": r[2], "human_score_avg": r[3], "page_count": r[4], "status": r[5], "created_at": str(r[6])} for r in rows]
 
 
 @app.post("/reset")
@@ -724,9 +832,10 @@ def reset_all():
         conn.execute(text("TRUNCATE TABLE quiz_questions RESTART IDENTITY CASCADE"))
         conn.execute(text("TRUNCATE TABLE chunks         RESTART IDENTITY CASCADE"))
         conn.execute(text("TRUNCATE TABLE pages          RESTART IDENTITY CASCADE"))
-        conn.execute(text("TRUNCATE TABLE version_chunks RESTART IDENTITY CASCADE"))
-        conn.execute(text("TRUNCATE TABLE version_pages  RESTART IDENTITY CASCADE"))
-        conn.execute(text("TRUNCATE TABLE versions       RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE version_eval_results RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE version_chunks       RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE version_pages        RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE versions             RESTART IDENTITY CASCADE"))
         conn.commit()
     return {"status": "ok", "message": "All data wiped. System is ready for fresh ingestion."}
 
