@@ -151,6 +151,8 @@ export default function App() {
 
   // Eval state
   const [evalStatus, setEvalStatus]     = useState(null)   // 'generating' | 'running' | null
+  const [evalNumQ, setEvalNumQ]         = useState(10)
+  const [evalCycles, setEvalCycles]     = useState(1)
   const [evalProgress, setEvalProgress] = useState(null)   // current step text
   const [evalResults, setEvalResults]   = useState([])     // per-question results as they arrive
   const [evalSummary, setEvalSummary]   = useState(null)   // { score_avg, total }
@@ -171,6 +173,7 @@ export default function App() {
   const [expandedRunData, setExpandedRunData] = useState(null)
   const [generatedQs, setGeneratedQs]   = useState([])
   const [quizCollapsed, setQuizCollapsed]       = useState(false)
+  const [confirmDeleteQ, setConfirmDeleteQ]     = useState(null)  // question id pending delete
   const [resultsCollapsed, setResultsCollapsed] = useState(false)
   const [questionsLoading, setQuestionsLoading] = useState(true)
 
@@ -180,6 +183,7 @@ export default function App() {
   const [logFilter, setLogFilter]       = useState('all')
   const [logConnected, setLogConnected] = useState(false)
   const logBottomRef = useRef(null)
+  const logContainerRef = useRef(null)
   const logPausedRef = useRef(false)
   const esRef        = useRef(null)
 
@@ -233,7 +237,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (!logPaused) logBottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (!logPaused && logContainerRef.current) { logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight }
   }, [logLines, logPaused])
 
   // ── Ingest ──────────────────────────────────────────────────────────────────
@@ -271,6 +275,15 @@ export default function App() {
       setPages(prev => prev.filter(p => p.id !== id))
     } catch (e) { setMessage({ type: 'error', text: `✗ ${e.message}` }) }
     finally { setDeleting(null) }
+  }
+
+  const deleteQuestion = async (id) => {
+    try {
+      const res = await fetch(`${API}/eval/questions/${id}`, { method: 'DELETE' })
+      if (!res.ok) throw new Error('Delete failed')
+      setGeneratedQs(prev => prev.filter(q => q.id !== id))
+    } catch (e) { setMessage({ type: 'error', text: `✗ ${e.message}` }) }
+    finally { setConfirmDeleteQ(null) }
   }
 
   const saveVersion = async () => {
@@ -329,6 +342,11 @@ export default function App() {
           if (p.type === 'warning')  setEvalProgress(`⚠ ${p.text}`)
           if (p.type === 'question') setGeneratedQs(prev => [...prev, { question: p.question, expected_answer: p.expected_answer, page_title: p.page_title }])
           if (p.type === 'error')    setEvalProgress(`✗ ${p.text}`)
+          if (p.type === 'cycle_done') {
+            setEvalSummary({ score_avg: p.score_avg, total: p.total })
+            setEvalProgress(p.cycles > 1 ? `Cycle ${p.cycle}/${p.cycles} complete — ${p.score_avg}/10` : null)
+            fetchRuns()
+          }
           if (p.type === 'done') {
             setEvalProgress(`✓ Generated ${p.count} questions`)
             fetchQuestions()
@@ -349,7 +367,7 @@ export default function App() {
     setQuizCollapsed(true)
 
     try {
-      const res    = await fetch(`${API}/eval/run`, { method: 'POST' })
+      const res    = await fetch(`${API}/eval/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ num_questions: evalNumQ, cycles: evalCycles }) })
       const reader = res.body.getReader()
       const dec    = new TextDecoder()
       let   buf    = ''
@@ -366,6 +384,11 @@ export default function App() {
           if (p.type === 'progress') setEvalProgress(`Q${p.question_num}/${p.total} — ${p.step}: ${p.question.slice(0, 60)}...`)
           if (p.type === 'result')   setEvalResults(prev => [...prev, p])
           if (p.type === 'error')    setEvalProgress(`✗ ${p.text}`)
+          if (p.type === 'cycle_done') {
+            setEvalSummary({ score_avg: p.score_avg, total: p.total })
+            setEvalProgress(p.cycles > 1 ? `Cycle ${p.cycle}/${p.cycles} complete — ${p.score_avg}/10` : null)
+            fetchRuns()
+          }
           if (p.type === 'done') {
             setEvalSummary({ score_avg: p.score_avg, total: p.total })
             setEvalProgress(null)
@@ -533,8 +556,8 @@ export default function App() {
         <h2 style={{ fontSize: 16, fontWeight: 500, marginBottom: 4 }}>Evaluation</h2>
         <p style={{ color: t.muted, fontSize: 13, marginBottom: 16 }}>Generate questions from the knowledge base, then run the RAG pipeline against them.</p>
 
-        {/* Action buttons */}
-        <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        {/* Action buttons + eval config */}
+        <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap', alignItems: 'center' }}>
           <button onClick={runGenerate} disabled={!!evalStatus}
             style={btn(!!evalStatus, '#7c3aed')}>
             {evalStatus === 'generating' ? '⟳ Generating...' : '⚡ Generate Questions'}
@@ -543,6 +566,18 @@ export default function App() {
             style={btn(!!evalStatus, '#059669')}>
             {evalStatus === 'running' ? '⟳ Evaluating...' : '▶ Run Evaluation'}
           </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: t.muted }}>
+            <span>Questions:</span>
+            <input type="number" min={1} max={10} value={evalNumQ}
+              onChange={e => setEvalNumQ(Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
+              style={{ width: 48, padding: '4px 8px', borderRadius: 6, border: `1px solid ${t.border}`, background: t.inputBg, color: t.text, fontSize: 13, textAlign: 'center' }} />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: t.muted }}>
+            <span>Cycles:</span>
+            <input type="number" min={1} max={5} value={evalCycles}
+              onChange={e => setEvalCycles(Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
+              style={{ width: 48, padding: '4px 8px', borderRadius: 6, border: `1px solid ${t.border}`, background: t.inputBg, color: t.text, fontSize: 13, textAlign: 'center' }} />
+          </div>
         </div>
 
         {/* Live progress */}
@@ -565,8 +600,24 @@ export default function App() {
                 {questionsLoading && <p style={{ color: t.muted, fontSize: 13 }}>Loading...</p>}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                   {generatedQs.map((q, i) => (
-                    <div key={i} style={{ padding: '10px 14px', border: `1px solid ${t.border}`, borderRadius: 8, fontSize: 13 }}>
-                      <div style={{ color: t.muted, fontSize: 11, marginBottom: 4 }}>{q.page_title}</div>
+                    <div key={q.id || i} style={{ padding: '10px 14px', border: `1px solid ${t.border}`, borderRadius: 8, fontSize: 13 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 4 }}>
+                        <div style={{ color: t.muted, fontSize: 11 }}>{q.page_title}</div>
+                        {confirmDeleteQ === q.id ? (
+                          <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexShrink: 0 }}>
+                            <span style={{ fontSize: 11, color: t.muted }}>Remove?</span>
+                            <button onClick={() => deleteQuestion(q.id)}
+                              style={{ padding: '2px 8px', background: '#ef4444', color: '#fff', border: 'none', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}>Yes</button>
+                            <button onClick={() => setConfirmDeleteQ(null)}
+                              style={{ padding: '2px 8px', background: t.surface, color: t.muted, border: `1px solid ${t.border}`, borderRadius: 4, fontSize: 11, cursor: 'pointer' }}>No</button>
+                          </div>
+                        ) : (
+                          <button onClick={() => setConfirmDeleteQ(q.id)}
+                            style={{ padding: '2px 8px', background: 'transparent', color: t.muted, border: `1px solid ${t.border}`, borderRadius: 4, fontSize: 11, cursor: 'pointer', flexShrink: 0 }}>
+                            ✕
+                          </button>
+                        )}
+                      </div>
                       <div style={{ fontWeight: 500, marginBottom: 4 }}>Q: {q.question}</div>
                       <div style={{ color: t.muted }}>A: {q.expected_answer}</div>
                     </div>
@@ -667,7 +718,7 @@ export default function App() {
             </button>
           ))}
         </div>
-        <div style={{ height: 320, overflowY: 'auto', background: t.logBg, borderRadius: 8, border: `1px solid ${t.border}`, padding: '10px 14px', fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }}>
+        <div ref={logContainerRef} style={{ height: 320, overflowY: 'auto', background: t.logBg, borderRadius: 8, border: `1px solid ${t.border}`, padding: '10px 14px', fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }}>
           {visibleLines.length === 0 && <span style={{ color: t.muted }}>Waiting for logs...</span>}
           {visibleLines.map(({ id, service, line }) => (
             <div key={id} style={{ display: 'flex', gap: 8, wordBreak: 'break-all' }}>

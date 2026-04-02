@@ -249,6 +249,10 @@ class IngestTextRequest(BaseModel):
 class AskRequest(BaseModel):
     question: str
 
+class EvalRunRequest(BaseModel):
+    num_questions: int = 10   # how many questions to use (1–10)
+    cycles:        int = 1    # how many back-to-back eval runs
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
@@ -378,6 +382,19 @@ def list_questions():
             """)
         ).fetchall()
     return [{"id": r[0], "question": r[1], "expected_answer": r[2], "created_at": str(r[3]), "page_title": r[4]} for r in rows]
+
+
+@app.delete("/eval/questions/{question_id}")
+def delete_question(question_id: int):
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("DELETE FROM quiz_questions WHERE id = :id RETURNING id"),
+            {"id": question_id}
+        )
+        if not result.fetchone():
+            raise HTTPException(status_code=404, detail="Question not found")
+        conn.commit()
+    return {"deleted": question_id}
 
 
 @app.get("/eval/runs")
@@ -510,14 +527,17 @@ Respond in this exact JSON format with no extra text:
 
 
 @app.post("/eval/run")
-def eval_run():
+def eval_run(req: EvalRunRequest = EvalRunRequest()):
     """Run evaluation: BM25 retrieve → Ollama answer → Ollama judge (0-10) for each question."""
+    num_questions = max(1, min(req.num_questions, EVAL_QUESTIONS))
+    cycles        = max(1, min(req.cycles, 5))
+
     def generate():
         # Load questions
         with engine.connect() as conn:
             rows = conn.execute(
                 text("SELECT id, question, expected_answer FROM quiz_questions ORDER BY created_at DESC LIMIT :n"),
-                {"n": EVAL_QUESTIONS}
+                {"n": num_questions}
             ).fetchall()
         questions = [{"id": r[0], "question": r[1], "expected_answer": r[2]} for r in rows]
 
@@ -525,90 +545,98 @@ def eval_run():
             yield f"data: {json.dumps({'type': 'error', 'text': 'No questions found. Generate questions first.'})}\n\n"
             return
 
-        # Create eval run record
-        with engine.connect() as conn:
-            result = conn.execute(text("INSERT INTO eval_runs (score_avg) VALUES (NULL) RETURNING id"))
-            run_id = result.fetchone()[0]
-            conn.commit()
+        yield f"data: {json.dumps({'type': 'status', 'text': f'Starting {cycles} evaluation cycle(s) of {len(questions)} questions each...'})}\n\n"
 
-        run_start = time.time()
-        yield f"data: {json.dumps({'type': 'status', 'text': f'Starting evaluation of {len(questions)} questions...'})}\n\n"
+        for cycle in range(cycles):
+            if cycles > 1:
+                yield f"data: {json.dumps({'type': 'status', 'text': f'Cycle {cycle+1}/{cycles}...'})}\n\n"
 
-        all_chunks = load_chunks()
-        scores     = []
-
-        for i, q in enumerate(questions):
-            # Step 1 — retrieve
-            yield f"data: {json.dumps({'type': 'progress', 'step': 'retrieving', 'question_num': i+1, 'total': len(questions), 'question': q['question']})}\n\n"
-            context = bm25_retrieve(q["question"], all_chunks) if all_chunks else ""
-
-            # Step 2 — answer
-            yield f"data: {json.dumps({'type': 'progress', 'step': 'answering', 'question_num': i+1, 'total': len(questions), 'question': q['question']})}\n\n"
-            answer_prompt = f"""You are a helpful assistant. Answer the question using ONLY the context below.
-If the answer is not in the context, say "I don't have information about that."
-Keep your answer concise — 1 to 2 sentences maximum.
-
-Context:
-{context}
-
-Question: {q['question']}
-
-Answer:"""
-            try:
-                actual_answer = call_ollama_sync(answer_prompt, timeout=600)
-            except Exception as e:
-                actual_answer = f"[error: {e}]"
-
-            # Step 3 — judge
-            yield f"data: {json.dumps({'type': 'progress', 'step': 'judging', 'question_num': i+1, 'total': len(questions), 'question': q['question']})}\n\n"
-            judge_prompt = f"""You are an evaluation judge. Your job is to check whether the actual answer contains the correct information from the expected answer.
-
-Question: {q['question']}
-Expected answer: {q['expected_answer']}
-Actual answer: {actual_answer}
-
-Scoring rules:
-- 10 = the actual answer contains the correct information, even if phrased differently or as a full sentence
-- 7-9 = mostly correct, minor omission or slight inaccuracy
-- 4-6 = partially correct, contains some right information but missing key parts
-- 1-3 = mostly wrong but tangentially related
-- 0 = completely wrong, irrelevant, or "I don't have information about that"
-
-IMPORTANT: Do NOT penalize for different phrasing, extra context, or full sentences vs fragments.
-Only check if the core factual content is correct.
-
-Respond with ONLY a single integer from 0 to 10. No explanation."""
-            try:
-                score_raw = call_ollama_sync(judge_prompt, timeout=600)
-                score     = int(re.search(r'\d+', score_raw).group())
-                score     = max(0, min(10, score))
-            except:
-                score = 0
-
-            scores.append(score)
-
-            # Save result
+            # Create eval run record
             with engine.connect() as conn:
-                row = conn.execute(
-                    text("INSERT INTO eval_results (run_id, question_id, actual_answer, score) VALUES (:run_id, :question_id, :actual_answer, :score) RETURNING id"),
-                    {"run_id": run_id, "question_id": q["id"], "actual_answer": actual_answer, "score": score}
-                )
-                result_id = row.fetchone()[0]
+                result = conn.execute(text("INSERT INTO eval_runs (score_avg) VALUES (NULL) RETURNING id"))
+                run_id = result.fetchone()[0]
                 conn.commit()
 
-            yield f"data: {json.dumps({'type': 'result', 'id': result_id, 'question_num': i+1, 'total': len(questions), 'question': q['question'], 'expected_answer': q['expected_answer'], 'actual_answer': actual_answer, 'score': score})}\n\n"
+            run_start = time.time()
+            yield f"data: {json.dumps({'type': 'status', 'text': f'Cycle {cycle+1}/{cycles} — evaluating {len(questions)} questions...'})}\n\n"
 
-        # Finalize run
-        score_avg        = round(sum(scores) / len(scores), 1) if scores else 0
-        duration_seconds = int(time.time() - run_start)
-        with engine.connect() as conn:
-            conn.execute(
-                text("UPDATE eval_runs SET score_avg = :score_avg, duration_seconds = :duration WHERE id = :id"),
-                {"score_avg": score_avg, "duration": duration_seconds, "id": run_id}
-            )
-            conn.commit()
+            all_chunks = load_chunks()
+            scores     = []
 
-        yield f"data: {json.dumps({'type': 'done', 'run_id': run_id, 'score_avg': score_avg, 'total': len(questions), 'duration_seconds': duration_seconds})}\n\n"
+            for i, q in enumerate(questions):
+                # Step 1 — retrieve
+                yield f"data: {json.dumps({'type': 'progress', 'step': 'retrieving', 'question_num': i+1, 'total': len(questions), 'question': q['question']})}\n\n"
+                context = bm25_retrieve(q["question"], all_chunks) if all_chunks else ""
+
+                # Step 2 — answer
+                yield f"data: {json.dumps({'type': 'progress', 'step': 'answering', 'question_num': i+1, 'total': len(questions), 'question': q['question']})}\n\n"
+                answer_prompt = f"""You are a helpful assistant. Answer the question using ONLY the context below.
+    If the answer is not in the context, say "I don't have information about that."
+    Keep your answer concise — 1 to 2 sentences maximum.
+
+    Context:
+    {context}
+
+    Question: {q['question']}
+
+    Answer:"""
+                try:
+                    actual_answer = call_ollama_sync(answer_prompt, timeout=600)
+                except Exception as e:
+                    actual_answer = f"[error: {e}]"
+
+                # Step 3 — judge
+                yield f"data: {json.dumps({'type': 'progress', 'step': 'judging', 'question_num': i+1, 'total': len(questions), 'question': q['question']})}\n\n"
+                judge_prompt = f"""You are an evaluation judge. Your job is to check whether the actual answer contains the correct information from the expected answer.
+
+    Question: {q['question']}
+    Expected answer: {q['expected_answer']}
+    Actual answer: {actual_answer}
+
+    Scoring rules:
+    - 10 = the actual answer contains the correct information, even if phrased differently or as a full sentence
+    - 7-9 = mostly correct, minor omission or slight inaccuracy
+    - 4-6 = partially correct, contains some right information but missing key parts
+    - 1-3 = mostly wrong but tangentially related
+    - 0 = completely wrong, irrelevant, or "I don't have information about that"
+
+    IMPORTANT: Do NOT penalize for different phrasing, extra context, or full sentences vs fragments.
+    Only check if the core factual content is correct.
+
+    Respond with ONLY a single integer from 0 to 10. No explanation."""
+                try:
+                    score_raw = call_ollama_sync(judge_prompt, timeout=600)
+                    score     = int(re.search(r'\d+', score_raw).group())
+                    score     = max(0, min(10, score))
+                except:
+                    score = 0
+
+                scores.append(score)
+
+                # Save result
+                with engine.connect() as conn:
+                    row = conn.execute(
+                        text("INSERT INTO eval_results (run_id, question_id, actual_answer, score) VALUES (:run_id, :question_id, :actual_answer, :score) RETURNING id"),
+                        {"run_id": run_id, "question_id": q["id"], "actual_answer": actual_answer, "score": score}
+                    )
+                    result_id = row.fetchone()[0]
+                    conn.commit()
+
+                yield f"data: {json.dumps({'type': 'result', 'id': result_id, 'question_num': i+1, 'total': len(questions), 'question': q['question'], 'expected_answer': q['expected_answer'], 'actual_answer': actual_answer, 'score': score})}\n\n"
+
+            # Finalize run
+            score_avg        = round(sum(scores) / len(scores), 1) if scores else 0
+            duration_seconds = int(time.time() - run_start)
+            with engine.connect() as conn:
+                conn.execute(
+                    text("UPDATE eval_runs SET score_avg = :score_avg, duration_seconds = :duration WHERE id = :id"),
+                    {"score_avg": score_avg, "duration": duration_seconds, "id": run_id}
+                )
+                conn.commit()
+
+            yield f"data: {json.dumps({'type': 'cycle_done', 'cycle': cycle+1, 'cycles': cycles, 'run_id': run_id, 'score_avg': score_avg, 'total': len(questions), 'duration_seconds': duration_seconds})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'done', 'cycles': cycles})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
